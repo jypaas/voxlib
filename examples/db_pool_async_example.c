@@ -1,0 +1,276 @@
+/*
+ * db_pool_async_example.c - 连接池 + 异步示例（模拟多“请求”并发）
+ *
+ * 关键点：
+ * - 使用 vox_db_pool_t 避免单连接 busy
+ * - 这里演示 VOX_DB_CALLBACK_LOOP：回调切回 loop，便于与上层事件驱动系统集成
+ */
+
+#include "../vox_loop.h"
+#include "../vox_log.h"
+#include "../vox_mpool.h"
+#include "../db/vox_db.h"
+#include "../db/vox_db_pool.h"
+
+#include <stdio.h>
+#include <string.h>
+
+typedef struct {
+    vox_loop_t* loop;
+    vox_db_pool_t* pool;
+    int total;
+    int done;
+    int failed;
+    int query_total;
+    int query_done;
+    int query_failed;
+} app_t;
+
+typedef struct {
+    app_t* app;
+    vox_db_value_t params[2];
+    char* name;
+} insert_req_t;
+
+typedef struct {
+    app_t* app;
+    int query_id;
+    vox_db_value_t params[1];  /* 持久化参数，避免传栈上局部变量导致异步执行时读到无效值 */
+} query_req_t;
+
+/* 前向声明 */
+static void on_query_row(vox_db_conn_t* conn, const vox_db_row_t* row, void* user_data);
+static void on_query_done(vox_db_conn_t* conn, int status, int64_t row_count, void* user_data);
+
+static void on_exec(vox_db_conn_t* conn, int status, int64_t affected_rows, void* user_data) {
+    (void)conn;
+    (void)affected_rows;
+    insert_req_t* req = (insert_req_t*)user_data;
+    if (!req || !req->app) return;
+    app_t* app = req->app;
+    app->done++;
+    if (status != 0) app->failed++;
+    if (req->name) vox_mpool_free(vox_loop_get_mpool(app->loop), req->name);
+    vox_mpool_free(vox_loop_get_mpool(app->loop), req);
+    if (app->done >= app->total) {
+        VOX_LOG_INFO("pool exec done: total=%d failed=%d", app->total, app->failed);
+        /* 插入完成后，开始查询操作 */
+        VOX_LOG_INFO("start_work: starting query operations...");
+        app->query_total = 10;  /* 查询前10条记录 */
+        app->query_done = 0;
+        app->query_failed = 0;
+        
+        for (int i = 0; i < app->query_total; i++) {
+            vox_mpool_t* mp = vox_loop_get_mpool(app->loop);
+            query_req_t* qreq = (query_req_t*)vox_mpool_alloc(mp, sizeof(query_req_t));
+            if (!qreq) {
+                app->query_done++;
+                app->query_failed++;
+                continue;
+            }
+            memset(qreq, 0, sizeof(*qreq));
+            qreq->app = app;
+            qreq->query_id = i;
+            qreq->params[0].type = VOX_DB_TYPE_I64;
+            qreq->params[0].u.i64 = (int64_t)i;
+
+            if (vox_db_pool_query_async(app->pool, "SELECT id, name FROM t WHERE id = ? LIMIT 1;",
+                                        qreq->params, 1, on_query_row, on_query_done, qreq) != 0) {
+                vox_mpool_free(mp, qreq);
+                app->query_done++;
+                app->query_failed++;
+            }
+        }
+        
+        if (app->query_done >= app->query_total) {
+            VOX_LOG_INFO("pool query done: total=%d failed=%d", app->query_total, app->query_failed);
+            vox_loop_stop(app->loop);
+        }
+    }
+}
+
+static void on_query_row(vox_db_conn_t* conn, const vox_db_row_t* row, void* user_data) {
+    (void)conn;
+    query_req_t* req = (query_req_t*)user_data;
+    if (!req || !row) return;
+
+    /* 打印查询结果（id 为 INTEGER，name 为 TEXT） */
+    if (row->column_count >= 2) {
+        char id_buf[24];
+        const char* id_str = "NULL";
+        if (row->values[0].type == VOX_DB_TYPE_I64) {
+            (void)snprintf(id_buf, sizeof(id_buf), "%lld", (long long)row->values[0].u.i64);
+            id_buf[sizeof(id_buf) - 1] = '\0';
+            id_str = id_buf;
+        } else if (row->values[0].type == VOX_DB_TYPE_TEXT && row->values[0].u.text.ptr)
+            id_str = row->values[0].u.text.ptr;
+        const char* name_str = row->values[1].type == VOX_DB_TYPE_TEXT && row->values[1].u.text.ptr
+                               ? row->values[1].u.text.ptr : "NULL";
+        VOX_LOG_INFO("query[%d]: id=%s, name=%s", req->query_id, id_str, name_str);
+    }
+}
+
+static void on_query_done(vox_db_conn_t* conn, int status, int64_t row_count, void* user_data) {
+    query_req_t* req = (query_req_t*)user_data;
+    if (!req || !req->app) return;
+    app_t* app = req->app;
+    app->query_done++;
+    /* SQLite 在“上次调用成功”时 vox_db_last_error 会返回 "not an error"，此时不应按失败处理 */
+    if (status != 0) {
+        const char* err = conn ? vox_db_last_error(conn) : NULL;
+        if (err && strcmp(err, "not an error") != 0) {
+            app->query_failed++;
+            VOX_LOG_WARN("query[%d] failed: %s", req->query_id, err);
+        } else {
+            /* 无真实错误信息，视为成功（避免误报） */
+            VOX_LOG_INFO("query[%d] done: row_count=%lld", req->query_id, (long long)row_count);
+        }
+    } else {
+        VOX_LOG_INFO("query[%d] done: row_count=%lld", req->query_id, (long long)row_count);
+    }
+    vox_mpool_free(vox_loop_get_mpool(app->loop), req);
+    if (app->query_done >= app->query_total) {
+        VOX_LOG_INFO("pool query done: total=%d done=%d failed=%d", app->query_total, app->query_done, app->query_failed);
+        vox_loop_stop(app->loop);
+    }
+}
+
+static void start_work(vox_loop_t* loop, void* user_data) {
+    (void)loop;
+    app_t* app = (app_t*)user_data;
+    if (!app || !app->pool) {
+        VOX_LOG_ERROR("start_work: invalid app or pool");
+        if (app && app->loop) vox_loop_stop(app->loop);
+        return;
+    }
+
+    VOX_LOG_INFO("start_work: creating table...");
+    /* 建表（先同步做一次，简化流程） */
+    int64_t affected = 0;
+    if (vox_db_pool_exec(app->pool, "CREATE TABLE IF NOT EXISTS t(id INTEGER, name VARCHAR);", NULL, 0, &affected) != 0) {
+        VOX_LOG_ERROR("create table failed");
+        vox_loop_stop(app->loop);
+        return;
+    }
+    VOX_LOG_INFO("start_work: table created successfully");
+
+    /* 提交 N 次 insert */
+    const int N = 100;
+    app->total = N;
+    app->done = 0;
+    app->failed = 0;
+    app->query_total = 0;
+    app->query_done = 0;
+    app->query_failed = 0;
+    VOX_LOG_INFO("start_work: submitting %d insert operations...", N);
+
+    for (int i = 0; i < N; i++) {
+        vox_mpool_t* mp = vox_loop_get_mpool(app->loop);
+        insert_req_t* req = (insert_req_t*)vox_mpool_alloc(mp, sizeof(insert_req_t));
+        if (!req) {
+            app->done++;
+            app->failed++;
+            continue;
+        }
+        memset(req, 0, sizeof(*req));
+        req->app = app;
+
+        char tmp[32];
+        int n = snprintf(tmp, sizeof(tmp), "u%03d", i);
+        if (n < 0 || n >= (int)sizeof(tmp)) {
+            /* snprintf 失败或字符串被截断 */
+            vox_mpool_free(mp, req);
+            app->done++;
+            app->failed++;
+            continue;
+        }
+        req->name = (char*)vox_mpool_alloc(mp, (size_t)n + 1);
+        if (!req->name) {
+            vox_mpool_free(mp, req);
+            app->done++;
+            app->failed++;
+            continue;
+        }
+        memcpy(req->name, tmp, (size_t)n);
+        req->name[n] = '\0';
+
+        req->params[0].type = VOX_DB_TYPE_I64;
+        req->params[0].u.i64 = i;
+        req->params[1].type = VOX_DB_TYPE_TEXT;
+        req->params[1].u.text.ptr = req->name;
+        req->params[1].u.text.len = (size_t)n;
+
+        if (vox_db_pool_exec_async(app->pool, "INSERT INTO t VALUES(?, ?);", req->params, 2, on_exec, req) != 0) {
+            /* pool 无空闲连接时会失败：这里把失败也计入 */
+            if (req->name) vox_mpool_free(mp, req->name);
+            vox_mpool_free(mp, req);
+            app->done++;
+            app->failed++;
+            if (app->done % 10 == 0) {
+                VOX_LOG_WARN("start_work: %d operations failed so far", app->done);
+            }
+        }
+    }
+
+    VOX_LOG_INFO("start_work: submitted %d operations, done=%d failed=%d", N, app->done, app->failed);
+    
+    /* 如果所有操作都立即失败，需要停止循环 */
+    if (app->done >= app->total) {
+        VOX_LOG_INFO("pool exec done: total=%d failed=%d (all operations failed immediately)", app->total, app->failed);
+        vox_loop_stop(app->loop);
+    }
+}
+
+int main(void) {
+    vox_log_set_level(VOX_LOG_INFO);
+
+    VOX_LOG_INFO("main: creating event loop...");
+    vox_loop_t* loop = vox_loop_create();
+    if (!loop) {
+        fprintf(stderr, "vox_loop_create failed\n");
+        return 1;
+    }
+
+    /* 优先 sqlite3，其次 duckdb */
+    /* 注意：sqlite3/duckdb 的 ":memory:" 对每个连接是独立 DB。
+     * pool 场景必须使用文件 DB 或共享内存 URI，才能让所有连接共享同一个数据库。
+     * 使用动态连接池：初始 8 个连接，最大 32 个连接 */
+    VOX_LOG_INFO("main: creating database pool...");
+    /* 使用文件数据库，确保所有连接共享同一个数据库
+     * SQLite3 的共享内存模式 (cache=shared) 在多线程环境下可能不稳定
+     * 使用文件数据库可以确保线程安全和数据一致性 */
+    vox_db_pool_t* pool = vox_db_pool_create_ex(loop, VOX_DB_DRIVER_SQLITE3, "vox_pool_test.db", 8, 100);
+    if (!pool) {
+        pool = vox_db_pool_create_ex(loop, VOX_DB_DRIVER_DUCKDB, "vox_pool_test.db", 8, 100);
+    }
+
+    if (!pool) {
+        VOX_LOG_ERROR("main: failed to create database connection pool");
+        vox_loop_destroy(loop);
+        return 1;
+    }
+
+    /* 回调切回 loop（更贴近服务端使用方式） */
+    vox_db_pool_set_callback_mode(pool, VOX_DB_CALLBACK_LOOP);
+
+    app_t app = {0};
+    app.loop = loop;
+    app.pool = pool;
+
+    VOX_LOG_INFO("main: queueing start_work...");
+    /* 使用 queue_work 而不是 queue_work_immediate，确保在事件循环运行后再执行 */
+    if (vox_loop_queue_work(loop, start_work, &app) != 0) {
+        VOX_LOG_ERROR("failed to queue start_work");
+        vox_db_pool_destroy(pool);
+        vox_loop_destroy(loop);
+        return 1;
+    }
+    VOX_LOG_INFO("main: running event loop...");
+    vox_loop_run(loop, VOX_RUN_DEFAULT);
+    VOX_LOG_INFO("main: event loop stopped");
+
+    vox_db_pool_destroy(pool);
+    vox_loop_destroy(loop);
+    return 0;
+}
+
