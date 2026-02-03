@@ -254,8 +254,24 @@ static void pool_initial_connect_cb(vox_redis_client_t* client, int status, void
     if (status == 0) {
         /* 初始连接建立成功，加入空闲列表 */
         if (pool_push_idle_locked(pool, client) != 0) {
-            /* 无法加入空闲列表（异常情况，但不应发生） */
+            /* OOM：无法加入空闲列表，销毁连接避免泄漏 */
+            for (size_t i = 0; i < pool->initial_size; i++) {
+                if (pool->clients[i] == client) {
+                    pool->clients[i] = NULL;
+                    break;
+                }
+            }
+            vox_redis_client_destroy(client);
         }
+    } else {
+        /* 初始连接失败，销毁并清空槽位 */
+        for (size_t i = 0; i < pool->initial_size; i++) {
+            if (pool->clients[i] == client) {
+                pool->clients[i] = NULL;
+                break;
+            }
+        }
+        vox_redis_client_destroy(client);
     }
 
     bool all_done = (pool->initial_done >= pool->initial_size);
@@ -451,6 +467,15 @@ void vox_redis_pool_release(vox_redis_pool_t* pool, vox_redis_client_t* client) 
             memset(cn, 0, sizeof(*cn));
             cn->client = client;
             vox_list_push_back(&pool->idle_list, &cn->node);
+        } else {
+            /* OOM：无法放回空闲列表，断开并清空槽位避免连接泄漏 */
+            for (size_t i = 0; i < pool->initial_size; i++) {
+                if (pool->clients[i] == client) {
+                    pool->clients[i] = NULL;
+                    break;
+                }
+            }
+            vox_redis_client_destroy(client);
         }
         pool_serve_one_waiter_locked(pool);
         vox_mutex_unlock(&pool->mu);

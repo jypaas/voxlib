@@ -8,6 +8,7 @@
 
 #include "../db/vox_db.h"
 #include "../db/vox_db_pool.h"
+#include "../db/vox_orm.h"
 #include "vox_coroutine.h"
 
 #ifdef __cplusplus
@@ -129,6 +130,94 @@ int vox_coroutine_db_pool_query_await(vox_coroutine_t* co,
                                        size_t nparams,
                                        vox_db_row_t** out_rows,
                                        int64_t* out_row_count);
+
+/* ===== ORM 协程适配接口 ===== */
+
+/**
+ * 协程中建表
+ */
+int vox_coroutine_orm_create_table_await(vox_coroutine_t* co,
+                                         vox_db_conn_t* conn,
+                                         const char* table,
+                                         const vox_orm_field_t* fields,
+                                         size_t nfields);
+
+/**
+ * 协程中删表
+ */
+int vox_coroutine_orm_drop_table_await(vox_coroutine_t* co,
+                                       vox_db_conn_t* conn,
+                                       const char* table);
+
+/**
+ * 协程中插入一行
+ * @param out_affected 可为 NULL
+ */
+int vox_coroutine_orm_insert_await(vox_coroutine_t* co,
+                                  vox_db_conn_t* conn,
+                                  const char* table,
+                                  const vox_orm_field_t* fields,
+                                  size_t nfields,
+                                  const void* row_struct,
+                                  int64_t* out_affected);
+
+/**
+ * 协程中更新
+ * @param out_affected 可为 NULL
+ */
+int vox_coroutine_orm_update_await(vox_coroutine_t* co,
+                                   vox_db_conn_t* conn,
+                                   const char* table,
+                                   const vox_orm_field_t* fields,
+                                   size_t nfields,
+                                   const void* row_struct,
+                                   const char* where_clause,
+                                   const vox_db_value_t* where_params,
+                                   size_t n_where_params,
+                                   int64_t* out_affected);
+
+/**
+ * 协程中删除
+ * @param out_affected 可为 NULL
+ */
+int vox_coroutine_orm_delete_await(vox_coroutine_t* co,
+                                   vox_db_conn_t* conn,
+                                   const char* table,
+                                   const char* where_clause,
+                                   const vox_db_value_t* where_params,
+                                   size_t n_where_params,
+                                   int64_t* out_affected);
+
+/**
+ * 协程中查单行：结果写入 row_struct（调用方分配，至少 row_size 字节）
+ * @param out_found 可为 NULL；成功且查到一行时写 1，否则写 0
+ */
+int vox_coroutine_orm_select_one_await(vox_coroutine_t* co,
+                                       vox_db_conn_t* conn,
+                                       const char* table,
+                                       const vox_orm_field_t* fields,
+                                       size_t nfields,
+                                       void* row_struct,
+                                       size_t row_size,
+                                       const char* where_clause,
+                                       const vox_db_value_t* where_params,
+                                       size_t n_where_params,
+                                       int* out_found);
+
+/**
+ * 协程中查多行：结果 push 到 out_list（调用方创建 vox_vector），out_row_count 写行数
+ */
+int vox_coroutine_orm_select_await(vox_coroutine_t* co,
+                                   vox_db_conn_t* conn,
+                                   const char* table,
+                                   const vox_orm_field_t* fields,
+                                   size_t nfields,
+                                   size_t row_size,
+                                   vox_vector_t* out_list,
+                                   int64_t* out_row_count,
+                                   const char* where_clause,
+                                   const vox_db_value_t* where_params,
+                                   size_t n_where_params);
 
 #ifdef __cplusplus
 }

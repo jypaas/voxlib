@@ -170,11 +170,18 @@ int vox_http_ws_upgrade(vox_http_context_t* ctx, const vox_http_ws_callbacks_t* 
 
     char accept[64];
     int alen = vox_base64_encode(digest, sizeof(digest), accept, sizeof(accept));
-    if (alen <= 0) return -1;
+    if (alen <= 0) {
+        vox_mpool_free(ctx->mpool, concat);
+        return -1;
+    }
     accept[alen] = '\0';
     char* accept_copy = (char*)vox_mpool_alloc(ctx->mpool, (size_t)alen + 1);
-    if (!accept_copy) return -1;
+    if (!accept_copy) {
+        vox_mpool_free(ctx->mpool, concat);
+        return -1;
+    }
     memcpy(accept_copy, accept, (size_t)alen + 1);
+    vox_mpool_free(ctx->mpool, concat);
 
     /* 写 101 响应头（server 负责发送） */
     vox_http_context_status(ctx, 101);

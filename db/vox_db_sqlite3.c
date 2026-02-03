@@ -27,6 +27,13 @@ static const char* db_sqlite3_last_error(vox_db_conn_t* conn) {
 
 static int bind_params(sqlite3_stmt* stmt, const vox_db_value_t* params, size_t nparams) {
     if (!stmt) return -1;
+    if (nparams > 0) {
+        int n = sqlite3_bind_parameter_count(stmt);
+        if (n < 0 || (size_t)n < nparams) {
+            VOX_LOG_ERROR("[db/sqlite3] bind param count mismatch: nparams=%zu, stmt has %d placeholders", nparams, n);
+            return -1;
+        }
+    }
     for (size_t i = 0; i < nparams; i++) {
         const vox_db_value_t* v = &params[i];
         int idx = (int)i + 1; /* sqlite 参数从 1 开始 */

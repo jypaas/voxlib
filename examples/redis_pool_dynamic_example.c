@@ -5,9 +5,10 @@
 
 #include "../redis/vox_redis_pool.h"
 #include "../vox_loop.h"
+#include "../vox_mpool.h"
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
+#include <string.h>
 
 #define EXAMPLE_CTX_MAGIC 0x43545854u  /* "CTXT" */
 
@@ -15,6 +16,7 @@
 typedef struct {
     uint32_t magic;  /* EXAMPLE_CTX_MAGIC，用于校验 req->ctx 是否有效 */
     vox_loop_t* loop;
+    vox_mpool_t* mpool;
     vox_redis_pool_t* pool;
     int total_requests;
     int completed_requests;
@@ -52,7 +54,7 @@ static void on_set_response(vox_redis_client_t* client,
     req->ctx->completed_requests++;
     if (req->ctx->completed_requests >= req->ctx->total_requests)
         vox_loop_stop(req->ctx->loop);
-    free(req);
+    vox_mpool_free(req->ctx->mpool, req);
 }
 
 static void example_req_error(vox_redis_client_t* client,
@@ -94,7 +96,7 @@ static void example_acquire_cb(vox_redis_pool_t* pool,
 
     if (status != 0 || !client) {
         example_req_error(NULL, "acquire connection failed", req);
-        free(req);
+        vox_mpool_free(req->ctx->mpool, req);
         return;
     }
 
@@ -103,7 +105,7 @@ static void example_acquire_cb(vox_redis_pool_t* pool,
     if (rc != 0) {
         example_req_error(client, "redis SET failed", req);
         vox_redis_pool_release(req->ctx->pool, client);
-        free(req);
+        vox_mpool_free(req->ctx->mpool, req);
     }
 }
 
@@ -131,11 +133,12 @@ static void on_pool_ready(vox_redis_pool_t* pool, int status, void* user_data) {
     printf("发送 10 个请求（超过初始连接数）...\n");
     
     for (int i = 0; i < ctx->total_requests; i++) {
-        example_req_t* req = (example_req_t*)malloc(sizeof(example_req_t));
+        example_req_t* req = (example_req_t*)vox_mpool_alloc(ctx->mpool, sizeof(example_req_t));
         if (!req) {
             fprintf(stderr, "alloc example_req_t failed\n");
             continue;
         }
+        memset(req, 0, sizeof(*req));
         req->ctx = ctx;
         req->index = i + 1;
         snprintf(req->key, sizeof(req->key), "test_key_%d", i);
@@ -143,7 +146,7 @@ static void on_pool_ready(vox_redis_pool_t* pool, int status, void* user_data) {
         
         if (vox_redis_pool_acquire_async(pool, example_acquire_cb, req) != 0) {
             example_req_error(NULL, "acquire_async failed", req);
-            free(req);
+            vox_mpool_free(ctx->mpool, req);
         }
     }
     
@@ -154,10 +157,17 @@ static void on_pool_ready(vox_redis_pool_t* pool, int status, void* user_data) {
 
 static void example_dynamic_pool(vox_loop_t* loop) {
     printf("=== 示例 1: 动态连接池 ===\n\n");
-    
+
+    vox_mpool_t* mpool = vox_mpool_create();
+    if (!mpool) {
+        fprintf(stderr, "创建内存池失败\n");
+        return;
+    }
+
     example_ctx_t ctx = {
         .magic = EXAMPLE_CTX_MAGIC,
         .loop = loop,
+        .mpool = mpool,
         .pool = NULL,
         .total_requests = 10,
         .completed_requests = 0,
@@ -189,6 +199,7 @@ static void example_dynamic_pool(vox_loop_t* loop) {
     
     /* 清理 */
     vox_redis_pool_destroy(pool);
+    vox_mpool_destroy(mpool);
 }
 
 /* ===== 主程序 ===== */

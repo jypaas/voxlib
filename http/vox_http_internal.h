@@ -11,6 +11,8 @@
 #include "../vox_string.h"
 #include "../vox_vector.h"
 #include "../vox_loop.h"
+#include "../vox_file.h"
+#include "../vox_socket.h"
 #include "vox_http_parser.h"
 #include "vox_http_middleware.h"
 #include "vox_http_context.h"
@@ -48,6 +50,11 @@ struct vox_http_context {
     /* 由 server 注入：用于写回/升级等 */
     void* conn;            /* vox_http_conn_t*（在 server.c 内定义） */
     void* user_data;
+
+    /* sendfile：非 NULL 时响应体由 sendfile 发送，调用方不得关闭 file */
+    vox_file_t* sendfile_file;
+    int64_t sendfile_offset;
+    size_t sendfile_count;
 };
 
 /* ===== ws/transport 内部胶水（仅供 http/ 模块使用） ===== */

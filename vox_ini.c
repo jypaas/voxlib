@@ -289,7 +289,10 @@ char* vox_ini_to_string(const vox_ini_t* ini, size_t* out_size) {
             size_t new_cap = capacity * 2;
             while (len + needed >= new_cap) new_cap *= 2;
             char* new_buf = (char*)vox_mpool_realloc(ini->mpool, buf, new_cap);
-            if (!new_buf) return NULL;
+            if (!new_buf) {
+                vox_mpool_free(ini->mpool, buf);
+                return NULL;
+            }
             buf = new_buf;
             capacity = new_cap;
         }

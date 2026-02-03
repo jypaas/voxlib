@@ -239,7 +239,7 @@ struct vox_semaphore {
     HANDLE sem;
     volatile LONG count;  /* 用于获取当前值（近似值） */
 };
-#elif defined(__APPLE__)
+#elif defined(VOX_OS_MACOS)
 /* macOS 不支持 unnamed sem_t，用 mutex+cond 实现 */
 struct vox_semaphore {
     pthread_mutex_t mutex;

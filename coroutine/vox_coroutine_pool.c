@@ -2,7 +2,7 @@
  * vox_coroutine_pool.c - 协程池实现
  */
 
-#ifdef __APPLE__
+#ifdef VOX_OS_MACOS
 #define _DARWIN_C_SOURCE 1
 #endif
 
@@ -237,8 +237,10 @@ void vox_coroutine_pool_destroy(vox_coroutine_pool_t* pool) {
         destroy_slot(pool, slot);
     }
 
-    /* 销毁互斥锁 */
-    vox_mutex_destroy(&pool->mutex);
+    /* 仅当创建过互斥锁时才销毁 */
+    if (pool->config.thread_safe) {
+        vox_mutex_destroy(&pool->mutex);
+    }
 
     vox_mpool_free(pool->mpool, pool);
 }

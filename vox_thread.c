@@ -22,7 +22,7 @@
     #include <sched.h>
     #include <sys/resource.h>
     #include <errno.h>
-    #ifdef __linux__
+    #ifdef VOX_OS_LINUX
         #include <sys/syscall.h>
     #endif
 #endif
@@ -295,7 +295,7 @@ int vox_thread_set_priority(vox_thread_t* thread, vox_thread_priority_t priority
     }
     
     /* 使用setpriority设置nice值 */
-    #ifdef __linux__
+    #ifdef VOX_OS_LINUX
         /* 在Linux上，使用gettid()获取线程ID */
         /* 注意：setpriority的PRIO_PROCESS选项在某些系统上可能不支持线程级别的设置 */
         /* 我们尝试使用gettid()获取线程ID，如果失败则使用getpid()获取进程ID */

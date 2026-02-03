@@ -123,6 +123,11 @@ void vox_db_disconnect(vox_db_conn_t* conn);
 vox_loop_t* vox_db_get_loop(vox_db_conn_t* conn);
 
 /**
+ * 获取连接使用的内存池（用于 ORM 等上层分配行缓冲）
+ */
+vox_mpool_t* vox_db_get_mpool(vox_db_conn_t* conn);
+
+/**
  * 获取连接使用的驱动类型（便于示例或上层按驱动选择 SQL 方言）
  */
 vox_db_driver_t vox_db_get_driver(vox_db_conn_t* conn);

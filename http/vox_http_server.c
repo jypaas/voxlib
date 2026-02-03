@@ -58,6 +58,11 @@ typedef struct vox_http_conn {
 
     /* 当前 ctx（复用，避免反复分配） */
     vox_http_context_t ctx;
+
+    /* sendfile：headers 写完后由 write_done 发送文件体并关闭 file */
+    vox_file_t* sendfile_file;
+    int64_t sendfile_offset;
+    size_t sendfile_count;
 } vox_http_conn_t;
 
 struct vox_http_server {
@@ -93,6 +98,9 @@ static void vox_http_conn_reset_request(vox_http_conn_t* c) {
     c->ctx.index = 0;
     c->ctx.aborted = false;
     c->ctx.deferred = false;
+    c->ctx.sendfile_file = NULL;
+    c->ctx.sendfile_offset = 0;
+    c->ctx.sendfile_count = 0;
     c->deferred_pending = false;
 }
 
@@ -115,6 +123,33 @@ int vox_http_conn_send_response(void* conn) {
     /* 进入写回阶段，解除 defer 阻塞 */
     c->deferred_pending = false;
 
+    vox_http_context_t* ctx = &c->ctx;
+    /* TLS 无法使用 sendfile，将文件读入 body */
+    if (ctx->sendfile_file && c->is_tls) {
+        vox_string_t* body = ctx->res.body ? ctx->res.body : vox_string_create(c->mpool);
+        if (body) {
+            char buf[65536];
+            int64_t n;
+            if (ctx->sendfile_offset > 0 && vox_file_seek(ctx->sendfile_file, ctx->sendfile_offset, VOX_FILE_SEEK_SET) != 0) {
+                vox_file_close(ctx->sendfile_file);
+                ctx->sendfile_file = NULL;
+            } else {
+                size_t remain = ctx->sendfile_count;
+                while (remain > 0 && (n = vox_file_read(ctx->sendfile_file, buf, remain > sizeof(buf) ? sizeof(buf) : remain)) > 0) {
+                    vox_string_append_data(body, buf, (size_t)n);
+                    remain -= (size_t)n;
+                }
+                if (!ctx->res.body) ctx->res.body = body;
+                vox_file_close(ctx->sendfile_file);
+            }
+        } else {
+            vox_file_close(ctx->sendfile_file);
+        }
+        ctx->sendfile_file = NULL;
+        ctx->sendfile_offset = 0;
+        ctx->sendfile_count = 0;
+    }
+
     vox_http_request_t* req = &c->ctx.req;
 
     /* keep-alive / close 决策 */
@@ -135,6 +170,16 @@ int vox_http_conn_send_response(void* conn) {
     if (!c->out) c->out = vox_string_create(c->mpool);
     if (!c->out) return -1;
     if (vox_http_context_build_response(&c->ctx, c->out) != 0) return -1;
+
+    /* 若使用 sendfile，将 file 交给 conn，headers 已写入 out */
+    if (ctx->sendfile_file && !c->is_tls) {
+        c->sendfile_file = ctx->sendfile_file;
+        c->sendfile_offset = ctx->sendfile_offset;
+        c->sendfile_count = ctx->sendfile_count;
+        ctx->sendfile_file = NULL;
+    } else {
+        c->sendfile_file = NULL;
+    }
 
     /* 暂停读取，避免 pipeline 触发并发响应 */
     if (c->is_tls) {
@@ -170,14 +215,18 @@ static int vox_http_conn_commit_header(vox_http_conn_t* c) {
     if (nlen == 0) return 0;
     size_t vlen = vox_string_length(c->cur_h_value);
 
+    const char* nsrc = vox_string_cstr(c->cur_h_name);
+    const char* vsrc = vox_string_cstr(c->cur_h_value);
+
     vox_http_header_t* kv = (vox_http_header_t*)vox_mpool_alloc(c->mpool, sizeof(vox_http_header_t));
     if (!kv) return -1;
 
-    const char* nsrc = vox_string_cstr(c->cur_h_name);
-    const char* vsrc = vox_string_cstr(c->cur_h_value);
     char* ncopy = (char*)vox_mpool_alloc(c->mpool, nlen + 1);
     char* vcopy = (char*)vox_mpool_alloc(c->mpool, vlen + 1);
-    if (!ncopy || !vcopy) return -1;
+    if (!ncopy || !vcopy) {
+        vox_mpool_free(c->mpool, kv);
+        return -1;
+    }
     memcpy(ncopy, nsrc, nlen);
     ncopy[nlen] = '\0';
     memcpy(vcopy, vsrc, vlen);
@@ -185,7 +234,12 @@ static int vox_http_conn_commit_header(vox_http_conn_t* c) {
 
     kv->name = (vox_strview_t){ ncopy, nlen };
     kv->value = (vox_strview_t){ vcopy, vlen };
-    if (vox_vector_push(c->headers, kv) != 0) return -1;
+    if (vox_vector_push(c->headers, kv) != 0) {
+        vox_mpool_free(c->mpool, kv);
+        vox_mpool_free(c->mpool, ncopy);
+        vox_mpool_free(c->mpool, vcopy);
+        return -1;
+    }
 
     /* Connection/Upgrade/WS 相关快速判断 */
     if (vox_http_strieq(kv->name.ptr, kv->name.len, "Connection", 10)) {
@@ -482,8 +536,24 @@ static void vox_http_tcp_write_done(vox_tcp_t* tcp, int status, void* user_data)
     if (!c) return;
     c->write_pending = false;
     if (status != 0) {
+        if (c->sendfile_file) {
+            vox_file_close(c->sendfile_file);
+            c->sendfile_file = NULL;
+        }
         vox_http_conn_close(c);
         return;
+    }
+    /* sendfile：headers 已发送，再发送文件体 */
+    if (c->sendfile_file && c->tcp) {
+        intptr_t fd = vox_file_get_fd(c->sendfile_file);
+        size_t sent = 0;
+        int r = vox_socket_sendfile(&c->tcp->socket, fd, c->sendfile_offset, c->sendfile_count, &sent);
+        vox_file_close(c->sendfile_file);
+        c->sendfile_file = NULL;
+        if (r != 0 || (sent > 0 && sent < c->sendfile_count)) {
+            vox_http_conn_close(c);
+            return;
+        }
     }
     if (c->should_close_after_write) {
         vox_http_conn_close(c);
@@ -918,7 +988,12 @@ int vox_http_server_listen_tcp(vox_http_server_t* server, const vox_socket_addr_
     vox_tcp_nodelay(tcp, true);
     vox_tcp_keepalive(tcp, true);
 
-    if (vox_tcp_bind(tcp, addr, 0) != 0) {
+    /* Unix 多进程 worker 需 SO_REUSEPORT 才能同端口 bind，避免 respawn 死循环 */
+    unsigned int bind_flags = 0;
+#ifndef VOX_OS_WINDOWS
+    bind_flags = VOX_PORT_REUSE_FLAG;
+#endif
+    if (vox_tcp_bind(tcp, addr, bind_flags) != 0) {
         vox_handle_close((vox_handle_t*)tcp, NULL);
         return -1;
     }
@@ -944,7 +1019,12 @@ int vox_http_server_listen_tls(vox_http_server_t* server, vox_ssl_context_t* ssl
     vox_tls_nodelay(tls, true);
     vox_tls_keepalive(tls, true);
 
-    if (vox_tls_bind(tls, addr, 0) != 0) {
+    /* Unix 多进程 worker 需 SO_REUSEPORT 才能同端口 bind */
+    unsigned int bind_flags = 0;
+#ifndef VOX_OS_WINDOWS
+    bind_flags = VOX_PORT_REUSE_FLAG;
+#endif
+    if (vox_tls_bind(tls, addr, bind_flags) != 0) {
         vox_handle_close((vox_handle_t*)tls, NULL);
         return -1;
     }

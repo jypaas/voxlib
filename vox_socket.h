@@ -224,6 +224,13 @@ int vox_socket_address_to_string(const vox_socket_addr_t* addr, char* buf, size_
  */
 uint16_t vox_socket_get_port(const vox_socket_addr_t* addr);
 
+/**
+ * 设置端口号（主机字节序）
+ * @param addr 地址结构
+ * @param port 端口号（主机字节序）
+ */
+void vox_socket_set_port(vox_socket_addr_t* addr, uint16_t port);
+
 /* ===== TCP操作 ===== */
 
 /**
@@ -300,6 +307,18 @@ int64_t vox_socket_sendto(vox_socket_t* sock, const void* buf, size_t len,
  */
 int64_t vox_socket_recvfrom(vox_socket_t* sock, void* buf, size_t len, 
                             vox_socket_addr_t* addr);
+
+/**
+ * 从文件发送到 socket（零拷贝，仅 TCP；TLS 连接不可用）
+ * @param sock 目标 socket（TCP）
+ * @param file_fd_or_handle Unix 为 fd (int)，Windows 为 HANDLE；由 vox_file_get_fd 获得
+ * @param offset 文件起始偏移（字节）
+ * @param count 要发送的字节数
+ * @param out_sent 输出实际发送字节数（可为 NULL）
+ * @return 成功返回0，失败返回-1
+ */
+int vox_socket_sendfile(vox_socket_t* sock, intptr_t file_fd_or_handle,
+                        int64_t offset, size_t count, size_t* out_sent);
 
 /* ===== 地址信息 ===== */
 

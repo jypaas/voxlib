@@ -147,6 +147,9 @@ int test_check_failure(void);
         } \
     } while (0)
 
+#define TEST_ASSERT_TRUE(condition, msg) TEST_ASSERT(condition, msg)
+#define TEST_ASSERT_FALSE(condition, msg) TEST_ASSERT(!(condition), msg)
+
 /* 运行单个测试用例 */
 int test_run_case(const char* suite_name, const char* case_name, test_case_func_t func, vox_mpool_t* mpool);
 

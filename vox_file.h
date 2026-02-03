@@ -66,6 +66,13 @@ vox_file_t* vox_file_open(vox_mpool_t* mpool, const char* path, vox_file_mode_t 
 int vox_file_close(vox_file_t* file);
 
 /**
+ * 获取文件描述符/句柄（用于 sendfile 等零拷贝）
+ * @param file 文件指针
+ * @return Unix 返回 fd (int)，Windows 返回 HANDLE；无效时返回 (intptr_t)-1
+ */
+intptr_t vox_file_get_fd(vox_file_t* file);
+
+/**
  * 读取文件数据
  * @param file 文件指针
  * @param buffer 缓冲区

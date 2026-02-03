@@ -6,6 +6,7 @@
 #include "vox_coroutine_promise.h"
 #include "../db/vox_db_internal.h"
 #include "../db/vox_db_pool.h"
+#include "../db/vox_orm.h"
 #include "../vox_log.h"
 
 #include <string.h>
@@ -529,4 +530,274 @@ int vox_coroutine_db_pool_query_await(vox_coroutine_t* co,
     int ret = vox_coroutine_db_query_await(co, conn, sql, params, nparams, out_rows, out_row_count);
     vox_db_pool_release(db_pool, conn);
     return ret;
+}
+
+/* ===== ORM 协程适配实现 ===== */
+
+typedef struct {
+    vox_coroutine_promise_t* promise;
+    int64_t* out_affected;
+    int64_t affected;
+} orm_exec_await_data_t;
+
+static void orm_exec_await_cb(vox_db_conn_t* conn, int status, int64_t affected_rows, void* user_data) {
+    VOX_UNUSED(conn);
+    orm_exec_await_data_t* data = (orm_exec_await_data_t*)user_data;
+    if (!data || !data->promise) return;
+    if (data->out_affected) *data->out_affected = affected_rows;
+    data->affected = affected_rows;
+    vox_coroutine_promise_complete(data->promise, status, NULL);
+}
+
+static int orm_await_common(vox_coroutine_t* co, vox_coroutine_promise_t* promise, orm_exec_await_data_t* data) {
+    vox_loop_t* loop = vox_coroutine_get_loop(co);
+    int status = vox_coroutine_await(co, promise);
+    vox_coroutine_promise_destroy(promise);
+    if (loop) vox_mpool_free(vox_loop_get_mpool(loop), data);
+    return status;
+}
+
+int vox_coroutine_orm_create_table_await(vox_coroutine_t* co,
+                                         vox_db_conn_t* conn,
+                                         const char* table,
+                                         const vox_orm_field_t* fields,
+                                         size_t nfields) {
+    if (!co || !conn || !table || !fields) return -1;
+    vox_loop_t* loop = vox_coroutine_get_loop(co);
+    if (!loop) return -1;
+    vox_coroutine_promise_t* promise = vox_coroutine_promise_create(loop);
+    if (!promise) return -1;
+    vox_mpool_t* mp = vox_loop_get_mpool(loop);
+    orm_exec_await_data_t* data = (orm_exec_await_data_t*)vox_mpool_alloc(mp, sizeof(orm_exec_await_data_t));
+    if (!data) {
+        vox_coroutine_promise_destroy(promise);
+        return -1;
+    }
+    memset(data, 0, sizeof(*data));
+    data->promise = promise;
+    if (vox_orm_create_table_async(conn, table, fields, nfields, orm_exec_await_cb, data) != 0) {
+        vox_mpool_free(mp, data);
+        vox_coroutine_promise_destroy(promise);
+        return -1;
+    }
+    return orm_await_common(co, promise, data);
+}
+
+int vox_coroutine_orm_drop_table_await(vox_coroutine_t* co,
+                                       vox_db_conn_t* conn,
+                                       const char* table) {
+    if (!co || !conn || !table) return -1;
+    vox_loop_t* loop = vox_coroutine_get_loop(co);
+    if (!loop) return -1;
+    vox_coroutine_promise_t* promise = vox_coroutine_promise_create(loop);
+    if (!promise) return -1;
+    vox_mpool_t* mp = vox_loop_get_mpool(loop);
+    orm_exec_await_data_t* data = (orm_exec_await_data_t*)vox_mpool_alloc(mp, sizeof(orm_exec_await_data_t));
+    if (!data) {
+        vox_coroutine_promise_destroy(promise);
+        return -1;
+    }
+    memset(data, 0, sizeof(*data));
+    data->promise = promise;
+    if (vox_orm_drop_table_async(conn, table, orm_exec_await_cb, data) != 0) {
+        vox_mpool_free(mp, data);
+        vox_coroutine_promise_destroy(promise);
+        return -1;
+    }
+    return orm_await_common(co, promise, data);
+}
+
+int vox_coroutine_orm_insert_await(vox_coroutine_t* co,
+                                   vox_db_conn_t* conn,
+                                   const char* table,
+                                   const vox_orm_field_t* fields,
+                                   size_t nfields,
+                                   const void* row_struct,
+                                   int64_t* out_affected) {
+    if (!co || !conn || !table || !fields || !row_struct) return -1;
+    vox_loop_t* loop = vox_coroutine_get_loop(co);
+    if (!loop) return -1;
+    vox_coroutine_promise_t* promise = vox_coroutine_promise_create(loop);
+    if (!promise) return -1;
+    vox_mpool_t* mp = vox_loop_get_mpool(loop);
+    orm_exec_await_data_t* data = (orm_exec_await_data_t*)vox_mpool_alloc(mp, sizeof(orm_exec_await_data_t));
+    if (!data) {
+        vox_coroutine_promise_destroy(promise);
+        return -1;
+    }
+    memset(data, 0, sizeof(*data));
+    data->promise = promise;
+    data->out_affected = out_affected;
+    if (vox_orm_insert_async(conn, table, fields, nfields, row_struct, orm_exec_await_cb, data) != 0) {
+        vox_mpool_free(mp, data);
+        vox_coroutine_promise_destroy(promise);
+        return -1;
+    }
+    return orm_await_common(co, promise, data);
+}
+
+int vox_coroutine_orm_update_await(vox_coroutine_t* co,
+                                   vox_db_conn_t* conn,
+                                   const char* table,
+                                   const vox_orm_field_t* fields,
+                                   size_t nfields,
+                                   const void* row_struct,
+                                   const char* where_clause,
+                                   const vox_db_value_t* where_params,
+                                   size_t n_where_params,
+                                   int64_t* out_affected) {
+    if (!co || !conn || !table || !fields || !row_struct || !where_clause) return -1;
+    vox_loop_t* loop = vox_coroutine_get_loop(co);
+    if (!loop) return -1;
+    vox_coroutine_promise_t* promise = vox_coroutine_promise_create(loop);
+    if (!promise) return -1;
+    vox_mpool_t* mp = vox_loop_get_mpool(loop);
+    orm_exec_await_data_t* data = (orm_exec_await_data_t*)vox_mpool_alloc(mp, sizeof(orm_exec_await_data_t));
+    if (!data) {
+        vox_coroutine_promise_destroy(promise);
+        return -1;
+    }
+    memset(data, 0, sizeof(*data));
+    data->promise = promise;
+    data->out_affected = out_affected;
+    if (vox_orm_update_async(conn, table, fields, nfields, row_struct, where_clause, where_params, n_where_params, orm_exec_await_cb, data) != 0) {
+        vox_mpool_free(mp, data);
+        vox_coroutine_promise_destroy(promise);
+        return -1;
+    }
+    return orm_await_common(co, promise, data);
+}
+
+int vox_coroutine_orm_delete_await(vox_coroutine_t* co,
+                                   vox_db_conn_t* conn,
+                                   const char* table,
+                                   const char* where_clause,
+                                   const vox_db_value_t* where_params,
+                                   size_t n_where_params,
+                                   int64_t* out_affected) {
+    if (!co || !conn || !table || !where_clause) return -1;
+    vox_loop_t* loop = vox_coroutine_get_loop(co);
+    if (!loop) return -1;
+    vox_coroutine_promise_t* promise = vox_coroutine_promise_create(loop);
+    if (!promise) return -1;
+    vox_mpool_t* mp = vox_loop_get_mpool(loop);
+    orm_exec_await_data_t* data = (orm_exec_await_data_t*)vox_mpool_alloc(mp, sizeof(orm_exec_await_data_t));
+    if (!data) {
+        vox_coroutine_promise_destroy(promise);
+        return -1;
+    }
+    memset(data, 0, sizeof(*data));
+    data->promise = promise;
+    data->out_affected = out_affected;
+    if (vox_orm_delete_async(conn, table, where_clause, where_params, n_where_params, orm_exec_await_cb, data) != 0) {
+        vox_mpool_free(mp, data);
+        vox_coroutine_promise_destroy(promise);
+        return -1;
+    }
+    return orm_await_common(co, promise, data);
+}
+
+typedef struct {
+    vox_coroutine_promise_t* promise;
+    void* row_struct;
+    size_t row_size;
+    int* out_found;
+} orm_select_one_await_data_t;
+
+static void orm_select_one_await_cb(vox_db_conn_t* conn, int status, void* row_struct, void* user_data) {
+    VOX_UNUSED(conn);
+    orm_select_one_await_data_t* data = (orm_select_one_await_data_t*)user_data;
+    if (!data || !data->promise) return;
+    if (status == 0 && row_struct && data->row_struct && data->row_size > 0)
+        memcpy(data->row_struct, row_struct, data->row_size);
+    if (data->out_found) *data->out_found = (status == 0 && row_struct) ? 1 : 0;
+    vox_coroutine_promise_complete(data->promise, status, NULL);
+}
+
+int vox_coroutine_orm_select_one_await(vox_coroutine_t* co,
+                                       vox_db_conn_t* conn,
+                                       const char* table,
+                                       const vox_orm_field_t* fields,
+                                       size_t nfields,
+                                       void* row_struct,
+                                       size_t row_size,
+                                       const char* where_clause,
+                                       const vox_db_value_t* where_params,
+                                       size_t n_where_params,
+                                       int* out_found) {
+    if (!co || !conn || !table || !fields || nfields == 0 || !row_struct || !where_clause) return -1;
+    if (out_found) *out_found = 0;
+    vox_loop_t* loop = vox_coroutine_get_loop(co);
+    if (!loop) return -1;
+    vox_coroutine_promise_t* promise = vox_coroutine_promise_create(loop);
+    if (!promise) return -1;
+    vox_mpool_t* mp = vox_loop_get_mpool(loop);
+    orm_select_one_await_data_t* data = (orm_select_one_await_data_t*)vox_mpool_alloc(mp, sizeof(orm_select_one_await_data_t));
+    if (!data) {
+        vox_coroutine_promise_destroy(promise);
+        return -1;
+    }
+    memset(data, 0, sizeof(*data));
+    data->promise = promise;
+    data->row_struct = row_struct;
+    data->row_size = row_size;
+    data->out_found = out_found;
+    if (vox_orm_select_one_async(conn, table, fields, nfields, row_size, where_clause, where_params, n_where_params, orm_select_one_await_cb, data) != 0) {
+        vox_mpool_free(mp, data);
+        vox_coroutine_promise_destroy(promise);
+        return -1;
+    }
+    int status = vox_coroutine_await(co, promise);
+    vox_coroutine_promise_destroy(promise);
+    vox_mpool_free(mp, data);
+    return status;
+}
+
+typedef struct {
+    vox_coroutine_promise_t* promise;
+    int64_t* out_row_count;
+} orm_select_await_data_t;
+
+static void orm_select_done_cb(vox_db_conn_t* conn, int status, int64_t row_count, void* user_data) {
+    VOX_UNUSED(conn);
+    orm_select_await_data_t* data = (orm_select_await_data_t*)user_data;
+    if (!data || !data->promise) return;
+    if (data->out_row_count) *data->out_row_count = row_count;
+    vox_coroutine_promise_complete(data->promise, status, NULL);
+}
+
+int vox_coroutine_orm_select_await(vox_coroutine_t* co,
+                                   vox_db_conn_t* conn,
+                                   const char* table,
+                                   const vox_orm_field_t* fields,
+                                   size_t nfields,
+                                   size_t row_size,
+                                   vox_vector_t* out_list,
+                                   int64_t* out_row_count,
+                                   const char* where_clause,
+                                   const vox_db_value_t* where_params,
+                                   size_t n_where_params) {
+    if (!co || !conn || !table || !fields || nfields == 0 || !out_list) return -1;
+    vox_loop_t* loop = vox_coroutine_get_loop(co);
+    if (!loop) return -1;
+    vox_coroutine_promise_t* promise = vox_coroutine_promise_create(loop);
+    if (!promise) return -1;
+    vox_mpool_t* mp = vox_loop_get_mpool(loop);
+    orm_select_await_data_t* data = (orm_select_await_data_t*)vox_mpool_alloc(mp, sizeof(orm_select_await_data_t));
+    if (!data) {
+        vox_coroutine_promise_destroy(promise);
+        return -1;
+    }
+    memset(data, 0, sizeof(*data));
+    data->promise = promise;
+    data->out_row_count = out_row_count;
+    if (vox_orm_select_async(conn, table, fields, nfields, row_size, out_list, where_clause, where_params, n_where_params, orm_select_done_cb, data) != 0) {
+        vox_mpool_free(mp, data);
+        vox_coroutine_promise_destroy(promise);
+        return -1;
+    }
+    int status = vox_coroutine_await(co, promise);
+    vox_coroutine_promise_destroy(promise);
+    vox_mpool_free(mp, data);
+    return status;
 }

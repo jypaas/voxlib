@@ -19,7 +19,12 @@ vox_ws_parser_t* vox_ws_parser_create(vox_mpool_t* mpool) {
     parser->buffer = vox_string_create(mpool);
     parser->fragment = vox_string_create(mpool);
     
-    if (!parser->buffer || !parser->fragment) return NULL;
+    if (!parser->buffer || !parser->fragment) {
+        if (parser->buffer) vox_string_destroy(parser->buffer);
+        if (parser->fragment) vox_string_destroy(parser->fragment);
+        vox_mpool_free(mpool, parser);
+        return NULL;
+    }
     
     return parser;
 }
@@ -254,8 +259,13 @@ int vox_ws_build_close_frame(vox_mpool_t* mpool, uint16_t code, const char* reas
         memcpy(payload + 2, reason, reason_len);
     }
     
-    return vox_ws_build_frame(mpool, VOX_WS_OP_CLOSE, payload, payload_len, 
+    int r = vox_ws_build_frame(mpool, VOX_WS_OP_CLOSE, payload, payload_len,
                               masked, out_frame, out_len);
+    if (r != 0) {
+        vox_mpool_free(mpool, payload);
+        return -1;
+    }
+    return 0;
 }
 
 /* UTF-8 验证 */

@@ -362,6 +362,7 @@ static int db_pgsql_query(vox_db_conn_t* conn,
         if (!col_names || !row_vals) {
             if (col_names) vox_mpool_free(conn->mpool, col_names);
             if (row_vals) vox_mpool_free(conn->mpool, row_vals);
+            snprintf(n->last_error, sizeof(n->last_error), "query: out of memory for %d columns", cols);
             PQclear(res);
             return -1;
         }

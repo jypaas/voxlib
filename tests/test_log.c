@@ -61,6 +61,43 @@ static void test_log_callback_set(vox_mpool_t* mpool) {
     vox_log_set_callback(NULL, NULL);
 }
 
+/* 测试格式选项设置与获取 */
+static void test_log_options(vox_mpool_t* mpool) {
+    VOX_UNUSED(mpool);
+    vox_log_options_t opts, read_back;
+
+    vox_log_get_options(&read_back);
+    TEST_ASSERT_EQ(read_back.show_time, 1, "默认应输出时间");
+    TEST_ASSERT_EQ(read_back.show_file_line, 1, "默认应输出文件行号");
+    TEST_ASSERT_EQ(read_back.show_func, 1, "默认应输出函数名");
+
+    opts.show_time = 0;
+    opts.show_file_line = 0;
+    opts.show_func = 0;
+    vox_log_set_options(&opts);
+    vox_log_get_options(&read_back);
+    TEST_ASSERT_EQ(read_back.show_time, 0, "关闭时间后应为0");
+    TEST_ASSERT_EQ(read_back.show_file_line, 0, "关闭文件行号后应为0");
+    TEST_ASSERT_EQ(read_back.show_func, 0, "关闭函数名后应为0");
+
+    opts.show_time = 1;
+    opts.show_file_line = 1;
+    opts.show_func = 1;
+    vox_log_set_options(&opts);
+    vox_log_get_options(&read_back);
+    TEST_ASSERT_EQ(read_back.show_time, 1, "重新开启后应为1");
+    TEST_ASSERT_EQ(read_back.show_file_line, 1, "重新开启后应为1");
+    TEST_ASSERT_EQ(read_back.show_func, 1, "重新开启后应为1");
+
+    /* 仅关闭部分项时输出不崩溃 */
+    opts.show_time = 0;
+    opts.show_file_line = 1;
+    opts.show_func = 0;
+    vox_log_set_options(&opts);
+    VOX_LOG_INFO("options test message");
+    vox_log_set_options(&read_back); /* 恢复默认 */
+}
+
 /* 测试日志级别过滤 */
 static void test_log_level_filter(vox_mpool_t* mpool) {
     VOX_UNUSED(mpool);
@@ -83,6 +120,7 @@ test_case_t test_log_cases[] = {
     {"level", test_log_level},
     {"write", test_log_write},
     {"callback", test_log_callback_set},
+    {"options", test_log_options},
     {"level_filter", test_log_level_filter},
 };
 

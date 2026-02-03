@@ -329,7 +329,11 @@ static int commit_header_if_any(vox_http_client_req_t* req) {
     const char* vsrc = vox_string_cstr(req->cur_h_value);
     char* ncopy = (char*)vox_mpool_alloc(req->mpool, nlen + 1);
     char* vcopy = (char*)vox_mpool_alloc(req->mpool, vlen + 1);
-    if (!ncopy || !vcopy) return -1;
+    if (!ncopy) return -1;
+    if (!vcopy) {
+        vox_mpool_free(req->mpool, ncopy);
+        return -1;
+    }
     memcpy(ncopy, nsrc, nlen);
     ncopy[nlen] = '\0';
     memcpy(vcopy, vsrc, vlen);
@@ -342,7 +346,11 @@ static int commit_header_if_any(vox_http_client_req_t* req) {
         /* 创建缓冲区用于收集压缩的响应体 */
         if (!req->compressed_body) {
             req->compressed_body = vox_string_create(req->mpool);
-            if (!req->compressed_body) return -1;
+            if (!req->compressed_body) {
+                vox_mpool_free(req->mpool, ncopy);
+                vox_mpool_free(req->mpool, vcopy);
+                return -1;
+            }
         }
     }
 #endif /* VOX_USE_ZLIB */
@@ -720,7 +728,14 @@ static vox_http_client_req_t* req_create(vox_http_client_t* client) {
     req->cur_h_value = vox_string_create(req->mpool);
     req->out = vox_string_create(req->mpool);
     req->compressed_body = vox_string_create(req->mpool);
-    if (!req->cur_h_name || !req->cur_h_value || !req->out || !req->compressed_body) return NULL;
+    if (!req->cur_h_name || !req->cur_h_value || !req->out || !req->compressed_body) {
+        if (req->cur_h_name) vox_string_destroy(req->cur_h_name);
+        if (req->cur_h_value) vox_string_destroy(req->cur_h_value);
+        if (req->out) vox_string_destroy(req->out);
+        if (req->compressed_body) vox_string_destroy(req->compressed_body);
+        vox_mpool_free(client->mpool, req);
+        return NULL;
+    }
     req->is_gzip_encoded = false;
 
     vox_http_parser_config_t cfg = {0};
@@ -742,9 +757,22 @@ static vox_http_client_req_t* req_create(vox_http_client_t* client) {
     pcbs.user_data = req;
 
     req->parser = vox_http_parser_create(req->mpool, &cfg, &pcbs);
-    if (!req->parser) return NULL;
+    if (!req->parser) {
+        vox_string_destroy(req->cur_h_name);
+        vox_string_destroy(req->cur_h_value);
+        vox_string_destroy(req->out);
+        vox_string_destroy(req->compressed_body);
+        vox_mpool_free(client->mpool, req);
+        return NULL;
+    }
 
     if (vox_timer_init(&req->connect_timer, req->loop) != 0) {
+        vox_http_parser_destroy(req->parser);
+        vox_string_destroy(req->cur_h_name);
+        vox_string_destroy(req->cur_h_value);
+        vox_string_destroy(req->out);
+        vox_string_destroy(req->compressed_body);
+        vox_mpool_free(client->mpool, req);
         return NULL;
     }
     return req;

@@ -7,8 +7,9 @@
 
 #include "../redis/vox_redis_pool.h"
 #include "../vox_loop.h"
+#include "../vox_mpool.h"
 #include <stdio.h>
-#include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 /* ===== 测试配置 ===== */
@@ -20,6 +21,7 @@
 
 typedef struct {
     vox_loop_t* loop;
+    vox_mpool_t* mpool;
     vox_redis_pool_t* pool;
     const char* pool_name;
     int total_requests;
@@ -110,7 +112,7 @@ static void pool_request_response_cb(vox_redis_client_t* client,
     pool_request_t* req = (pool_request_t*)user_data;
     test_response(client, response, req->ctx);
     vox_redis_pool_release(req->ctx->pool, client);
-    free(req);
+    vox_mpool_free(req->ctx->mpool, req);
 }
 
 /* 单个请求的错误回调：转调统计回调并归还连接 */
@@ -122,7 +124,7 @@ static void pool_request_error_cb(vox_redis_client_t* client,
     if (client) {
         vox_redis_pool_release(req->ctx->pool, client);
     }
-    free(req);
+    vox_mpool_free(req->ctx->mpool, req);
 }
 
 /* acquire 回调：拿到连接后发送 SET 命令 */
@@ -171,11 +173,12 @@ static void run_test(test_context_t* ctx) {
     
     /* 发送测试请求：每个请求独立 acquire -> SET -> release */
     for (int i = 0; i < ctx->total_requests; i++) {
-        pool_request_t* req = (pool_request_t*)malloc(sizeof(pool_request_t));
+        pool_request_t* req = (pool_request_t*)vox_mpool_alloc(ctx->mpool, sizeof(pool_request_t));
         if (!req) {
             test_error(NULL, "out of memory for request", ctx);
             continue;
         }
+        memset(req, 0, sizeof(*req));
         req->ctx = ctx;
         snprintf(req->key, sizeof(req->key), "test_key_%d", i);
         snprintf(req->value, sizeof(req->value), "test_value_%d", i);
@@ -243,6 +246,11 @@ int main(int argc, char* argv[]) {
     printf("===== 测试 1: 固定大小连接池 =====\n");
     
     test_context_t ctx_fixed = {0};
+    ctx_fixed.mpool = vox_mpool_create();
+    if (!ctx_fixed.mpool) {
+        fprintf(stderr, "创建内存池失败\n");
+        return 1;
+    }
     ctx_fixed.pool_name = "固定连接池（50个连接）";
     ctx_fixed.total_requests = TEST_REQUESTS;
     
@@ -274,6 +282,7 @@ int main(int argc, char* argv[]) {
     vox_loop_run(loop, VOX_RUN_DEFAULT);
     
     vox_redis_pool_destroy(ctx_fixed.pool);
+    vox_mpool_destroy(ctx_fixed.mpool);
     vox_loop_destroy(loop);
     
     printf("\n等待 2 秒后开始下一个测试...\n");
@@ -283,6 +292,11 @@ int main(int argc, char* argv[]) {
     printf("\n===== 测试 2: 动态连接池（初始10，最大50） =====\n");
     
     test_context_t ctx_dynamic = {0};
+    ctx_dynamic.mpool = vox_mpool_create();
+    if (!ctx_dynamic.mpool) {
+        fprintf(stderr, "创建内存池失败\n");
+        return 1;
+    }
     ctx_dynamic.pool_name = "动态连接池（初始10，最大50）";
     ctx_dynamic.total_requests = TEST_REQUESTS;
 
@@ -315,12 +329,18 @@ int main(int argc, char* argv[]) {
     vox_loop_run(loop, VOX_RUN_DEFAULT);
     
     vox_redis_pool_destroy(ctx_dynamic.pool);
+    vox_mpool_destroy(ctx_dynamic.mpool);
     vox_loop_destroy(loop);
     
     /* ===== 测试 3: 小型动态连接池 ===== */
     printf("\n===== 测试 3: 小型动态连接池（初始3，最大100） =====\n");
     
     test_context_t ctx_small = {0};
+    ctx_small.mpool = vox_mpool_create();
+    if (!ctx_small.mpool) {
+        fprintf(stderr, "创建内存池失败\n");
+        return 1;
+    }
     ctx_small.pool_name = "小型动态连接池（初始3，最大100）";
     ctx_small.total_requests = TEST_REQUESTS;
 

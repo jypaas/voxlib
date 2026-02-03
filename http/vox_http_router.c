@@ -10,6 +10,7 @@
 
 typedef struct vox_http_rnode {
     bool is_param;
+    bool is_splat;   /* 单段 * 通配：匹配任意剩余路径，用于根路径通配静态兜底 */
     /* 静态段：segment 指向 mpool 拷贝；参数段：param_name 指向 mpool 拷贝 */
     char* segment;
     size_t segment_len;
@@ -152,10 +153,11 @@ int vox_http_router_add(vox_http_router_t* router,
             node = vox_http_rnode_get_or_add_param_child(router->mpool, node, name, name_len);
             if (!node) return -1;
         } else {
-            /* static 段 */
+            /* static 段；单段 "*" 视为通配（匹配任意路径） */
             vox_http_rnode_t* c = vox_http_rnode_find_static_child(node, path + seg_start, seg_len);
             if (!c) c = vox_http_rnode_add_static_child(router->mpool, node, path + seg_start, seg_len);
             if (!c) return -1;
+            if (seg_len == 1 && path[seg_start] == '*') c->is_splat = true;
             node = c;
         }
 
@@ -203,12 +205,18 @@ int vox_http_router_match(vox_http_router_t* router,
             continue;
         }
 
-        /* 先匹配 static，其次 param */
+        /* 先匹配 static，其次 * 通配，再 param */
         vox_http_rnode_t* c = vox_http_rnode_find_static_child(node, path + seg_start, seg_len);
         if (c) {
             node = c;
             i++;
             continue;
+        }
+        /* 单段 "*" 且 is_splat：匹配任意路径，直接使用该节点 */
+        c = vox_http_rnode_find_static_child(node, "*", 1);
+        if (c && c->is_splat) {
+            node = c;
+            break;
         }
         if (node->param_child) {
             node = node->param_child;
@@ -221,6 +229,7 @@ int vox_http_router_match(vox_http_router_t* router,
                 vox_http_param_t* np = (vox_http_param_t*)vox_mpool_alloc(mpool, new_cap * sizeof(vox_http_param_t));
                 if (!np) return -1;
                 memcpy(np, params, params_count * sizeof(vox_http_param_t));
+                vox_mpool_free(mpool, params);
                 params = np;
                 params_cap2 = new_cap;
             }

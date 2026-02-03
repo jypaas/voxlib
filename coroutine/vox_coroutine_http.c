@@ -47,25 +47,24 @@ static void http_on_header(vox_http_client_req_t* req, vox_strview_t name, vox_s
         state->header_capacity = new_capacity;
     }
     
-    /* 复制header */
+    /* 复制header：name 与 value 都成功才计入，否则释放已分配避免泄漏 */
     size_t idx = state->response->header_count;
     
-    /* 分配并复制name */
     char* name_copy = (char*)vox_mpool_alloc(state->mpool, name.len + 1);
-    if (name_copy) {
-        memcpy(name_copy, name.ptr, name.len);
-        name_copy[name.len] = '\0';
-        state->response->headers[idx].name = name_copy;
-    }
+    if (!name_copy) return;
+    memcpy(name_copy, name.ptr, name.len);
+    name_copy[name.len] = '\0';
     
-    /* 分配并复制value */
     char* value_copy = (char*)vox_mpool_alloc(state->mpool, value.len + 1);
-    if (value_copy) {
-        memcpy(value_copy, value.ptr, value.len);
-        value_copy[value.len] = '\0';
-        state->response->headers[idx].value = value_copy;
+    if (!value_copy) {
+        vox_mpool_free(state->mpool, name_copy);
+        return;
     }
+    memcpy(value_copy, value.ptr, value.len);
+    value_copy[value.len] = '\0';
     
+    state->response->headers[idx].name = name_copy;
+    state->response->headers[idx].value = value_copy;
     state->response->header_count++;
 }
 

@@ -33,15 +33,18 @@
     #include <sys/file.h>
     #include <semaphore.h>
     #include <errno.h>
-    #ifdef __APPLE__
+    #ifdef VOX_OS_MACOS
         #include <crt_externs.h>
         #define environ (*_NSGetEnviron())
     #else
         extern char** environ;
         #include <sys/shm.h>
     #endif
-    #ifndef __APPLE__
+    #ifndef VOX_OS_MACOS
         #include <sys/sem.h>
+    #endif
+    #ifdef VOX_OS_LINUX
+        #include <sys/prctl.h>
     #endif
 #endif
 
@@ -75,6 +78,21 @@ static void init_process_options(vox_process_options_t* opts) {
     opts->stderr_redirect = VOX_PROCESS_REDIRECT_NONE;
     opts->detached = false;
     opts->create_no_window = false;
+}
+
+int vox_process_setname(const char* name) {
+#ifdef VOX_OS_LINUX
+    char buf[16];
+    size_t len = 0;
+    if (name) {
+        while (len < sizeof(buf) - 1 && name[len]) buf[len] = name[len], ++len;
+    }
+    buf[len] = '\0';
+    return prctl(PR_SET_NAME, buf, 0, 0, 0) == 0 ? 0 : -1;
+#else
+    (void)name;
+    return 0;
+#endif
 }
 
 vox_process_t* vox_process_create(vox_mpool_t* mpool, const char* command, 
@@ -1569,12 +1587,12 @@ int vox_ipc_semaphore_get_value(vox_ipc_semaphore_t* sem) {
     return (int)sem->count;
 #else
     int value;
-    #if defined(__APPLE__)
+    #if defined(VOX_OS_MACOS)
     #pragma clang diagnostic push
     #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     #endif
     int ret = (sem_getvalue(sem->sem, &value) == 0) ? value : -1;
-    #if defined(__APPLE__)
+    #if defined(VOX_OS_MACOS)
     #pragma clang diagnostic pop
     #endif
     return ret;

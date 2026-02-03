@@ -110,6 +110,13 @@ static inline int invoke_status(vox_http_parser_t* p, const char* data, size_t l
     return p->callbacks.on_status(p, data, len);
 }
 
+/* 去掉首尾 OWS（RFC 7230），解析器内统一处理，回调得到的是已 trim 的 field/value */
+static inline void trim_ows(const char** ptr, size_t* len) {
+    if (!ptr || !len || !*ptr) return;
+    while (*len > 0 && (**ptr == ' ' || **ptr == '\t')) { (*ptr)++; (*len)--; }
+    while (*len > 0 && ((*ptr)[*len - 1] == ' ' || (*ptr)[*len - 1] == '\t')) (*len)--;
+}
+
 static inline int invoke_header_field(vox_http_parser_t* p, const char* data, size_t len) {
     if (!p->callbacks.on_header_field || len == 0) return 0;
     return p->callbacks.on_header_field(p, data, len);
@@ -401,10 +408,14 @@ static int parse_headers(vox_http_parser_t* p, vox_scanner_t* sc) {
             }
             return 0;
         }
-        /* 行首为 LWS 表示续行（折叠到上一个 value） */
+        /* 行首为 LWS 表示续行（折叠到上一个 value），去掉续行尾部的 OWS 再回调 */
         if ((line.ptr[0] == ' ' || line.ptr[0] == '\t') && value_start) {
-            if (p->callbacks.on_header_value)
-                invoke_header_value(p, line.ptr, line.len);
+            const char* cont_ptr = line.ptr;
+            size_t cont_len = line.len;
+            while (cont_len > 0 && (cont_ptr[cont_len - 1] == ' ' || cont_ptr[cont_len - 1] == '\t'))
+                cont_len--;
+            if (p->callbacks.on_header_value && cont_len > 0)
+                invoke_header_value(p, cont_ptr, cont_len);
             value_len += 1 + line.len; /* 含前导空白 */
             vox_scanner_get_until_str(sc, "\r\n", true, &line);
             continue;
@@ -430,6 +441,7 @@ static int parse_headers(vox_http_parser_t* p, vox_scanner_t* sc) {
         }
         field_start = line.ptr;
         field_len = colon;
+        trim_ows(&field_start, &field_len);
         value_start = line.ptr + colon + 1;
         value_len = line.len - (colon + 1);
         while (value_len && (*value_start == ' ' || *value_start == '\t')) {

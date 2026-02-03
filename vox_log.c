@@ -13,6 +13,12 @@ static vox_log_level_t g_log_level = VOX_LOG_INFO;
 static vox_log_callback_t g_log_callback = NULL;
 static void *g_log_userdata = NULL;
 
+static vox_log_options_t g_log_options = {
+    1,  /* show_time */
+    1,  /* show_file_line */
+    1   /* show_func */
+};
+
 static const char *level_strings[] = {
     "FATAL", "ERROR", "WARN", "INFO", "DEBUG", "TRACE"
 };
@@ -27,6 +33,22 @@ void vox_log_set_level(vox_log_level_t level) {
 
 vox_log_level_t vox_log_get_level(void) {
     return g_log_level;
+}
+
+void vox_log_set_options(const vox_log_options_t *opts) {
+    if (opts) {
+        g_log_options.show_time = opts->show_time ? 1 : 0;
+        g_log_options.show_file_line = opts->show_file_line ? 1 : 0;
+        g_log_options.show_func = opts->show_func ? 1 : 0;
+    }
+}
+
+void vox_log_get_options(vox_log_options_t *opts) {
+    if (opts) {
+        opts->show_time = g_log_options.show_time;
+        opts->show_file_line = g_log_options.show_file_line;
+        opts->show_func = g_log_options.show_func;
+    }
 }
 
 void vox_log_set_callback(vox_log_callback_t callback, void *userdata) {
@@ -52,16 +74,22 @@ void vox_log_write(vox_log_level_t level,
     if (g_log_callback) {
         g_log_callback(level_strings[level], file, line, func, msg, g_log_userdata);
     } else {
-        vox_time_t now = vox_time_now();
-        char time_str[32];
-        vox_time_format(now, time_str, sizeof(time_str));
-        
-        const char *filename = strrchr(file, '/');
-        if (!filename) filename = strrchr(file, '\\');
-        filename = filename ? filename + 1 : file;
-        
-        fprintf(stderr, "%s%s [%s] %s:%d %s - %s\x1b[0m\n",
-                level_colors[level], level_strings[level],
-                time_str, filename, line, func, msg);
+        fprintf(stderr, "%s%s", level_colors[level], level_strings[level]);
+        if (g_log_options.show_time) {
+            vox_time_t now = vox_time_now();
+            char time_str[32];
+            vox_time_format(now, time_str, sizeof(time_str));
+            fprintf(stderr, " [%s]", time_str);
+        }
+        if (g_log_options.show_file_line) {
+            const char *filename = strrchr(file, '/');
+            if (!filename) filename = strrchr(file, '\\');
+            filename = filename ? filename + 1 : file;
+            fprintf(stderr, " %s:%d", filename, line);
+        }
+        if (g_log_options.show_func) {
+            fprintf(stderr, " %s", func);
+        }
+        fprintf(stderr, " - %s\x1b[0m\n", msg);
     }
 }

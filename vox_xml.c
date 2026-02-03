@@ -590,7 +590,10 @@ vox_xml_node_t* vox_xml_parse_str(vox_mpool_t* mpool, const char* xml_str,
     
     size_t size = len;
     vox_xml_node_t* root = vox_xml_parse(mpool, buffer, &size, err_info);
-    
+    if (!root) {
+        vox_mpool_free(mpool, buffer);
+        return NULL;
+    }
     return root;
 }
 
@@ -621,6 +624,7 @@ vox_xml_node_t* vox_xml_parse_file(vox_mpool_t* mpool, const char* filepath,
     if (size == 0 || buffer[size] != '\0') {
         char* new_buf = (char*)vox_mpool_realloc(mpool, buffer, size + 1);
         if (!new_buf) {
+            vox_mpool_free(mpool, buffer);
             if (err_info) {
                 err_info->line = 0;
                 err_info->column = 0;
@@ -635,7 +639,10 @@ vox_xml_node_t* vox_xml_parse_file(vox_mpool_t* mpool, const char* filepath,
 
     size_t parse_size = size;
     vox_xml_node_t* root = vox_xml_parse(mpool, buffer, &parse_size, err_info);
-
+    if (!root) {
+        vox_mpool_free(mpool, buffer);
+        return NULL;
+    }
     return root;
 }
 
@@ -1142,6 +1149,7 @@ int vox_xml_write_file(vox_mpool_t* mpool, const vox_xml_node_t* node, const cha
         size_t new_capacity = capacity * 2;
         char* new_buf = (char*)vox_mpool_realloc(mpool, buffer, new_capacity);
         if (!new_buf) {
+            vox_mpool_free(mpool, buffer);
             return -1;
         }
         buffer = new_buf;

@@ -1152,7 +1152,7 @@ int vox_crypto_random_bytes(void* buf, size_t len) {
 
 #elif defined(VOX_OS_LINUX) || defined(VOX_OS_UNIX) || defined(VOX_OS_DARWIN)
     /* Linux/Unix: 优先使用 getrandom() 系统调用 */
-    #if defined(__linux__) && defined(SYS_getrandom)
+    #if defined(VOX_OS_LINUX) && defined(SYS_getrandom)
     ssize_t ret = getrandom(buf, len, 0);
     if (ret >= 0 && (size_t)ret == len) {
         return 0;

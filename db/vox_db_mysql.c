@@ -121,7 +121,11 @@ static int db_mysql_connect(vox_db_conn_t* conn, const char* conninfo) {
         set_err(n, mysql_error(n->mysql));
         mysql_close(n->mysql);
         n->mysql = NULL;
-        /* host/user/pass/db/charset 是 mpool 分配，随连接销毁不再单独释放 */
+        if (host) vox_mpool_free(conn->mpool, host);
+        if (user) vox_mpool_free(conn->mpool, user);
+        if (pass) vox_mpool_free(conn->mpool, pass);
+        if (db) vox_mpool_free(conn->mpool, db);
+        if (charset) vox_mpool_free(conn->mpool, charset);
         vox_mpool_free(conn->mpool, n);
         return -1;
     }

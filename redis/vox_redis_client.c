@@ -187,6 +187,17 @@ static int copy_response_recursive(vox_mpool_t* mpool,
 static void client_fail(vox_redis_client_t* client, const char* msg) {
     if (!client) return;
     
+    /* 清理正在构建的响应（解析中途失败时可能存在；bulk_buf 由 current_response 引用，递归释放时会一并释放） */
+    if (client->current_response) {
+        free_response_recursive(client->mpool, client->current_response);
+        vox_mpool_free(client->mpool, client->current_response);
+        client->current_response = NULL;
+    }
+    client->bulk_buf = NULL;
+    client->bulk_expected = 0;
+    client->bulk_off = 0;
+    client->response_stack_size = 0;
+    
     if (client->current_cmd) {
         if (client->current_cmd->error_cb) {
             client->current_cmd->error_cb(client, msg, client->current_cmd->user_data);
@@ -556,15 +567,17 @@ static int on_complete(void* p) {
     if (client->current_response) {
         free_response_recursive(client->mpool, client->current_response);
         vox_mpool_free(client->mpool, client->current_response);
+        client->current_response = NULL;
     }
     
-    /* 清理当前命令 */
-    if (cmd->command_str) {
-        vox_string_destroy(cmd->command_str);
+    /* 仅当回调未触发 client_fail 时清理当前命令（client_fail 已释放 cmd 并置 current_cmd=NULL） */
+    if (client->current_cmd == cmd) {
+        if (cmd->command_str) {
+            vox_string_destroy(cmd->command_str);
+        }
+        vox_mpool_free(client->mpool, cmd);
+        client->current_cmd = NULL;
     }
-    vox_mpool_free(client->mpool, cmd);
-    client->current_cmd = NULL;
-    client->current_response = NULL;
     
     /* 清理响应栈 */
     client->response_stack_size = 0;
@@ -854,6 +867,8 @@ int vox_redis_client_connect(vox_redis_client_t* client,
         if (vox_tcp_connect(client->tcp, &addr, tcp_connect_cb) != 0) {
             VOX_LOG_ERROR("[redis] vox_tcp_connect failed");
             client->connecting = false;
+            vox_mpool_free(client->mpool, client->host);
+            client->host = NULL;
             return -1;
         }
         return 0;
@@ -868,6 +883,8 @@ int vox_redis_client_connect(vox_redis_client_t* client,
     if (!client->dns_req) {
         VOX_LOG_ERROR("[redis] failed to create DNS request");
         client->connecting = false;
+        vox_mpool_free(client->mpool, client->host);
+        client->host = NULL;
         return -1;
     }
     
@@ -877,6 +894,8 @@ int vox_redis_client_connect(vox_redis_client_t* client,
         vox_dns_getaddrinfo_destroy(client->dns_req);
         client->dns_req = NULL;
         client->connecting = false;
+        vox_mpool_free(client->mpool, client->host);
+        client->host = NULL;
         return -1;
     }
     

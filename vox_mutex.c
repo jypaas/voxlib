@@ -396,7 +396,7 @@ int vox_semaphore_create(vox_semaphore_t* sem, uint32_t initial_value) {
     }
     sem->count = (LONG)initial_value;
     return 0;
-#elif defined(__APPLE__)
+#elif defined(VOX_OS_MACOS)
     if (pthread_mutex_init(&sem->mutex, NULL) != 0) return -1;
     if (pthread_cond_init(&sem->cond, NULL) != 0) {
         pthread_mutex_destroy(&sem->mutex);
@@ -414,7 +414,7 @@ void vox_semaphore_destroy(vox_semaphore_t* sem) {
     
 #ifdef VOX_OS_WINDOWS
     CloseHandle(sem->sem);
-#elif defined(__APPLE__)
+#elif defined(VOX_OS_MACOS)
     pthread_cond_destroy(&sem->cond);
     pthread_mutex_destroy(&sem->mutex);
 #else
@@ -431,7 +431,7 @@ int vox_semaphore_wait(vox_semaphore_t* sem) {
         return 0;
     }
     return -1;
-#elif defined(__APPLE__)
+#elif defined(VOX_OS_MACOS)
     if (pthread_mutex_lock(&sem->mutex) != 0) return -1;
     while (sem->count == 0) {
         if (pthread_cond_wait(&sem->cond, &sem->mutex) != 0) {
@@ -456,7 +456,7 @@ int vox_semaphore_trywait(vox_semaphore_t* sem) {
         return 0;
     }
     return -1;
-#elif defined(__APPLE__)
+#elif defined(VOX_OS_MACOS)
     if (pthread_mutex_lock(&sem->mutex) != 0) return -1;
     if (sem->count == 0) {
         pthread_mutex_unlock(&sem->mutex);
@@ -484,7 +484,7 @@ int vox_semaphore_timedwait(vox_semaphore_t* sem, int32_t timeout_ms) {
         return 0;
     }
     return -1;
-#elif defined(__APPLE__)
+#elif defined(VOX_OS_MACOS)
     if (timeout_ms < 0) {
         return vox_semaphore_wait(sem);
     }
@@ -554,7 +554,7 @@ int vox_semaphore_post(vox_semaphore_t* sem) {
         return 0;
     }
     return -1;
-#elif defined(__APPLE__)
+#elif defined(VOX_OS_MACOS)
     if (pthread_mutex_lock(&sem->mutex) != 0) return -1;
     sem->count++;
     pthread_cond_signal(&sem->cond);
@@ -570,7 +570,7 @@ int vox_semaphore_get_value(vox_semaphore_t* sem) {
     
 #ifdef VOX_OS_WINDOWS
     return (int)sem->count;
-#elif defined(__APPLE__)
+#elif defined(VOX_OS_MACOS)
     if (pthread_mutex_lock(&sem->mutex) != 0) return -1;
     int value = (int)sem->count;
     pthread_mutex_unlock(&sem->mutex);

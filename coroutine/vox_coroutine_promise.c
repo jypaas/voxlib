@@ -132,6 +132,9 @@ int vox_coroutine_promise_complete(vox_coroutine_promise_t* promise,
         if (work) {
             work->co = waiting_co;
             vox_loop_queue_work(promise->loop, resume_coroutine_work, work);
+        } else {
+            /* OOM：无法入队恢复，需解除 await 时加的 loop 引用，避免泄漏 */
+            vox_loop_unref(promise->loop);
         }
     }
     

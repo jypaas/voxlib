@@ -125,6 +125,14 @@ int vox_process_get_status(vox_process_t* process, vox_process_status_t* status)
  */
 void vox_process_destroy(vox_process_t* process);
 
+/**
+ * 设置当前进程名（用于 ps/top 显示，类似 nginx 的 master/worker）
+ * Linux 下使用 prctl(PR_SET_NAME)，名字最多 15 个字符（16 字节含 \\0）；其他平台无操作。
+ * @param name 进程名，NULL 安全（无操作）
+ * @return Linux 成功返回 0，失败返回 -1；其他平台恒返回 0
+ */
+int vox_process_setname(const char* name);
+
 /* ===== 标准输入输出操作 ===== */
 
 /**

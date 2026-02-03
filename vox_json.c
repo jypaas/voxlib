@@ -588,7 +588,10 @@ vox_json_elem_t* vox_json_parse_str(vox_mpool_t* mpool, const char* json_str,
     
     size_t size = len;
     vox_json_elem_t* elem = vox_json_parse(mpool, buffer, &size, err_info);
-    
+    if (!elem) {
+        vox_mpool_free(mpool, buffer);
+        return NULL;
+    }
     return elem;
 }
 
@@ -621,6 +624,7 @@ vox_json_elem_t* vox_json_parse_file(vox_mpool_t* mpool, const char* filepath,
         /* vox_file_read_all 约定 size 不包含结尾 '\0'，此处手动补一个 */
         char* new_buf = (char*)vox_mpool_realloc(mpool, buffer, size + 1);
         if (!new_buf) {
+            vox_mpool_free(mpool, buffer);
             if (err_info) {
                 err_info->line = 0;
                 err_info->column = 0;
@@ -635,9 +639,11 @@ vox_json_elem_t* vox_json_parse_file(vox_mpool_t* mpool, const char* filepath,
 
     size_t parse_size = size;
     vox_json_elem_t* elem = vox_json_parse(mpool, buffer, &parse_size, err_info);
-
-    /* vox_json_parse 使用字符串视图引用 buffer，因此不能提前释放 buffer。
-       buffer 由 mpool 管理，会在 mpool_destroy 时释放。*/
+    if (!elem) {
+        vox_mpool_free(mpool, buffer);
+        return NULL;
+    }
+    /* vox_json_parse 使用字符串视图引用 buffer，成功时 buffer 由 mpool 管理，会在 mpool_destroy 时释放。*/
     return elem;
 }
 

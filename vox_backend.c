@@ -83,6 +83,7 @@ vox_backend_t* vox_backend_create_with_config(const vox_backend_config_t* config
         backend->impl = vox_select_create(&select_config);
         backend->name = "select";
         if (!backend->impl) {
+            vox_mpool_free(mpool, backend);
             if (own_mpool) {
                 vox_mpool_destroy(mpool);
             }
@@ -204,6 +205,7 @@ vox_backend_t* vox_backend_create_with_config(const vox_backend_config_t* config
         #endif
     } else {
         /* 不支持的 backend 类型 */
+        vox_mpool_free(mpool, backend);
         if (own_mpool) {
             vox_mpool_destroy(mpool);
         }
@@ -250,6 +252,7 @@ vox_backend_t* vox_backend_create_with_config(const vox_backend_config_t* config
     } else {
         /* 不支持的 backend 类型 */
         VOX_LOG_ERROR("Unsupported backend type on macOS/BSD: %d", backend_type);
+        vox_mpool_free(mpool, backend);
         if (own_mpool) {
             vox_mpool_destroy(mpool);
         }
@@ -296,6 +299,7 @@ vox_backend_t* vox_backend_create_with_config(const vox_backend_config_t* config
     } else {
         /* 不支持的 backend 类型 */
         VOX_LOG_ERROR("Unsupported backend type on Windows: %d", backend_type);
+        vox_mpool_free(mpool, backend);
         if (own_mpool) {
             vox_mpool_destroy(mpool);
         }
@@ -312,6 +316,7 @@ vox_backend_t* vox_backend_create_with_config(const vox_backend_config_t* config
     
     if (!backend->impl) {
         VOX_LOG_ERROR("Failed to create backend implementation");
+        vox_mpool_free(mpool, backend);
         if (own_mpool) {
             vox_mpool_destroy(mpool);
         }

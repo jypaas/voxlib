@@ -86,11 +86,19 @@ static int ws_parse_url(vox_mpool_t* mpool, const char* url, char** host, char**
     if (path_start) {
         path_len = strlen(path_start);
         *path = (char*)vox_mpool_alloc(mpool, path_len + 1);
-        if (!*path) return -1;
+        if (!*path) {
+            vox_mpool_free(mpool, *host);
+            *host = NULL;
+            return -1;
+        }
         memcpy(*path, path_start, path_len + 1);
     } else {
         *path = (char*)vox_mpool_alloc(mpool, 2);
-        if (!*path) return -1;
+        if (!*path) {
+            vox_mpool_free(mpool, *host);
+            *host = NULL;
+            return -1;
+        }
         strcpy(*path, "/");
     }
     
@@ -227,6 +235,7 @@ static char* ws_generate_key(vox_mpool_t* mpool) {
     
     int len = vox_base64_encode(random_bytes, sizeof(random_bytes), key, 32);
     if (len <= 0) {
+        vox_mpool_free(mpool, key);
         return NULL;
     }
     key[len] = '\0';
@@ -248,12 +257,14 @@ static char* ws_calculate_accept(vox_mpool_t* mpool, const char* key) {
     
     uint8_t digest[VOX_SHA1_DIGEST_SIZE];
     vox_sha1(concat, key_len + guid_len, digest);
+    vox_mpool_free(mpool, concat);
     
     char* accept = (char*)vox_mpool_alloc(mpool, 32);
     if (!accept) return NULL;
     
     int len = vox_base64_encode(digest, sizeof(digest), accept, 32);
     if (len <= 0) {
+        vox_mpool_free(mpool, accept);
         return NULL;
     }
     accept[len] = '\0';

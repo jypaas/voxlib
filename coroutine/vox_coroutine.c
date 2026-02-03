@@ -2,13 +2,13 @@
  * vox_coroutine.c - 协程系统实现
  */
 
-#ifdef __APPLE__
+#ifdef VOX_OS_MACOS
 #define _XOPEN_SOURCE 700
 #endif
 
 #include "vox_coroutine.h"
 
-#ifdef __APPLE__
+#ifdef VOX_OS_MACOS
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #endif
 #include "vox_coroutine_promise.h"

@@ -235,6 +235,10 @@ vox_loop_t* vox_db_get_loop(vox_db_conn_t* conn) {
     return conn ? conn->loop : NULL;
 }
 
+vox_mpool_t* vox_db_get_mpool(vox_db_conn_t* conn) {
+    return conn ? conn->mpool : NULL;
+}
+
 vox_db_driver_t vox_db_get_driver(vox_db_conn_t* conn) {
     return conn ? conn->driver : (vox_db_driver_t)0;
 }
@@ -600,13 +604,12 @@ static void db_query_task(void* user_data) {
             status = 0;
     }
 
-    /* 注意：不在这里调用 vox_db_conn_end()，busy 标志由回调函数释放
-     * 这样可以防止连接在回调执行前被其他线程重新获取 */
+    /* 注意：LOOP 模式下需在回调前释放 busy，否则用户在回调内再次提交 async 会因 conn 仍 busy 而失败 */
     if (req->u.query.done_cb) {
-        /* 已在 loop 线程且用户要 LOOP 回调：直接调，避免冗余 queue */
+        /* 已在 loop 线程且用户要 LOOP 回调：先释放 busy 再直接调，以便回调内可再次提交 async */
         if (req->on_loop_thread && conn->cb_mode == VOX_DB_CALLBACK_LOOP) {
-            req->u.query.done_cb(conn, status, rows, req->u.query.user_data);
             vox_db_conn_end(conn);
+            req->u.query.done_cb(conn, status, rows, req->u.query.user_data);
         } else if (conn->cb_mode == VOX_DB_CALLBACK_LOOP) {
             vox_db_done_call_t* call = (vox_db_done_call_t*)vox_mpool_alloc(conn->mpool, sizeof(vox_db_done_call_t));
             if (call) {

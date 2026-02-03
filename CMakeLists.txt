@@ -184,6 +184,7 @@ set(VOX_SOURCES
     http/vox_http_ws.c
     http/vox_http_client.c
     http/vox_http_gzip.c
+    http/vox_http_mime.c
     http/vox_http_middleware.c
 
     # WebSocket 支持
@@ -199,6 +200,7 @@ set(VOX_SOURCES
     # DB 模块（核心始终编译；驱动按需启用）
     db/vox_db.c
     db/vox_db_pool.c
+    db/vox_orm.c
 )
 
 # ===== 平台特定的源文件 =====
@@ -609,7 +611,7 @@ endif()
 if(WIN32)
     target_link_libraries(vox PRIVATE ws2_32 mswsock)
 elseif(UNIX)
-    target_link_libraries(vox PRIVATE pthread m)
+    target_link_libraries(vox PRIVATE pthread m resolv)
 endif()
 
 # ===== 安装规则 =====
@@ -772,6 +774,7 @@ if(VOX_BUILD_EXAMPLES)
 
     # DB 示例（当至少启用一个 DB 后端时才构建）
     if(VOX_USE_SQLITE3 OR VOX_USE_DUCKDB OR VOX_USE_PGSQL OR VOX_USE_MYSQL)
+        add_vox_example(db_orm_example)
         add_vox_example(db_example)
         add_vox_example(db_async_worker_example)
         add_vox_example(db_async_loop_example)

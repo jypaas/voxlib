@@ -25,7 +25,11 @@ static int vox_http_vec_push_handler(vox_mpool_t* mpool, vox_vector_t* vec, vox_
     vox_http_handler_cb* slot = (vox_http_handler_cb*)vox_mpool_alloc(mpool, sizeof(vox_http_handler_cb));
     if (!slot) return -1;
     *slot = cb;
-    return vox_vector_push(vec, slot);
+    if (vox_vector_push(vec, slot) != 0) {
+        vox_mpool_free(mpool, slot);
+        return -1;
+    }
+    return 0;
 }
 
 vox_http_engine_t* vox_http_engine_create(vox_loop_t* loop) {
@@ -65,7 +69,12 @@ vox_http_group_t* vox_http_engine_group(vox_http_engine_t* engine, const char* p
     g->engine = engine;
     g->prefix = vox_string_from_cstr(engine->mpool, prefix);
     g->middleware = vox_vector_create(engine->mpool);
-    if (!g->prefix || !g->middleware) return NULL;
+    if (!g->prefix || !g->middleware) {
+        if (g->prefix) vox_string_destroy(g->prefix);
+        if (g->middleware) vox_vector_destroy(g->middleware);
+        vox_mpool_free(engine->mpool, g);
+        return NULL;
+    }
     return g;
 }
 

@@ -1380,6 +1380,7 @@ vox_regex_t* vox_regex_compile(vox_mpool_t* mpool, const char* pattern, int flag
     size_t pattern_len = strlen(pattern);
     regex->pattern = (char*)vox_mpool_alloc(mpool, pattern_len + 1);
     if (!regex->pattern) {
+        vox_mpool_free(mpool, regex);
         return NULL;
     }
     memcpy(regex->pattern, pattern, pattern_len + 1);
@@ -1390,6 +1391,8 @@ vox_regex_t* vox_regex_compile(vox_mpool_t* mpool, const char* pattern, int flag
     nfa_fragment_t frag = parse_expr(mpool, &p, flags, &group_id);
     
     if (frag.start == NULL || *p != '\0') {
+        vox_mpool_free(mpool, regex->pattern);
+        vox_mpool_free(mpool, regex);
         return NULL;
     }
     
@@ -1408,12 +1411,21 @@ vox_regex_t* vox_regex_compile(vox_mpool_t* mpool, const char* pattern, int flag
     
     /* 创建匹配状态 */
     nfa_state_t* match_state = create_nfa_state(mpool, NFA_STATE_MATCH);
-    if (!match_state) return NULL;
+    if (!match_state) {
+        vox_mpool_free(mpool, regex->pattern);
+        vox_mpool_free(mpool, regex);
+        return NULL;
+    }
     
     if (frag.end && frag.end->type == NFA_STATE_SPLIT) {
         frag.end->out1 = match_state;
     } else if (frag.end) {
         nfa_state_t* split = create_nfa_state(mpool, NFA_STATE_SPLIT);
+        if (!split) {
+            vox_mpool_free(mpool, regex->pattern);
+            vox_mpool_free(mpool, regex);
+            return NULL;
+        }
         split->out1 = match_state;
         frag.end->out1 = split;
     }
@@ -1713,6 +1725,7 @@ int vox_regex_findall(vox_regex_t* regex, const char* text, size_t text_len,
     *matches = (vox_regex_match_t*)vox_mpool_alloc(
         regex->mpool, sizeof(vox_regex_match_t) * capacity);
     if (!*matches) {
+        free_match_context(ctx);
         return -1;
     }
     

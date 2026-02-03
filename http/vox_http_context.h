@@ -114,6 +114,17 @@ int vox_http_context_header(vox_http_context_t* ctx, const char* name, const cha
 int vox_http_context_write(vox_http_context_t* ctx, const void* data, size_t len);
 int vox_http_context_write_cstr(vox_http_context_t* ctx, const char* cstr);
 
+/**
+ * 使用 sendfile 发送文件体（仅非 TLS 连接；TLS 时回退为读入 body）
+ * 调用后不得关闭 file，由框架在发送完成后关闭。
+ * @param ctx HTTP 上下文
+ * @param file vox_file_open 打开的文件（只读），可为 NULL 表示不使用 sendfile
+ * @param offset 文件起始偏移（字节）
+ * @param count 要发送的字节数
+ * @return 成功返回0，失败返回-1
+ */
+int vox_http_context_send_file(vox_http_context_t* ctx, void* file, int64_t offset, size_t count);
+
 /* 构建 HTTP/1.x 响应报文到 out（包含 status line/headers/body） */
 int vox_http_context_build_response(const vox_http_context_t* ctx, vox_string_t* out);
 

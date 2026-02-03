@@ -155,6 +155,20 @@ void vox_ws_server_close(vox_ws_server_t* server) {
 }
 
 /* TCP 连接回调 */
+/* 释放连接资源（parser、handshake_buffer、conn），不关闭 tcp/tls */
+static void ws_conn_free_resources(vox_ws_connection_t* conn) {
+    if (!conn) return;
+    vox_mpool_t* mpool = conn->mpool;
+    if (conn->parser) {
+        vox_ws_parser_destroy(conn->parser);
+        vox_mpool_free(mpool, conn->parser);
+    }
+    if (conn->handshake_buffer) {
+        vox_string_destroy(conn->handshake_buffer);
+    }
+    vox_mpool_free(mpool, conn);
+}
+
 static void ws_on_tcp_connection(vox_tcp_t* server, int status, void* user_data) {
     (void)user_data;
     
@@ -175,14 +189,21 @@ static void ws_on_tcp_connection(vox_tcp_t* server, int status, void* user_data)
     conn->parser = vox_ws_parser_create(conn->mpool);
     conn->handshake_buffer = vox_string_create(conn->mpool);
     
-    if (!conn->parser || !conn->handshake_buffer) return;
+    if (!conn->parser || !conn->handshake_buffer) {
+        ws_conn_free_resources(conn);
+        return;
+    }
     
     /* 接受连接 */
     conn->tcp = vox_tcp_create(ws_server->loop);
-    if (!conn->tcp) return;
+    if (!conn->tcp) {
+        ws_conn_free_resources(conn);
+        return;
+    }
     
     if (vox_tcp_accept(server, conn->tcp) != 0) {
         vox_tcp_destroy(conn->tcp);
+        ws_conn_free_resources(conn);
         return;
     }
     
@@ -212,14 +233,21 @@ static void ws_on_tls_connection(vox_tls_t* server, int status, void* user_data)
     conn->parser = vox_ws_parser_create(conn->mpool);
     conn->handshake_buffer = vox_string_create(conn->mpool);
     
-    if (!conn->parser || !conn->handshake_buffer) return;
+    if (!conn->parser || !conn->handshake_buffer) {
+        ws_conn_free_resources(conn);
+        return;
+    }
     
     /* 接受连接 */
     conn->tls = vox_tls_create(ws_server->loop, ws_server->ssl_ctx);
-    if (!conn->tls) return;
+    if (!conn->tls) {
+        ws_conn_free_resources(conn);
+        return;
+    }
     
     if (vox_tls_accept(server, conn->tls) != 0) {
         vox_tls_destroy(conn->tls);
+        ws_conn_free_resources(conn);
         return;
     }
     
@@ -229,6 +257,7 @@ static void ws_on_tls_connection(vox_tls_t* server, int status, void* user_data)
     /* 开始 TLS 握手 */
     if (vox_tls_handshake(conn->tls, ws_on_tls_handshake) != 0) {
         vox_tls_destroy(conn->tls);
+        ws_conn_free_resources(conn);
         return;
     }
 }
@@ -243,6 +272,8 @@ static void ws_on_tls_handshake(vox_tls_t* tls, int status, void* user_data) {
     if (status != 0) {
         /* 握手失败 */
         vox_tls_destroy(conn->tls);
+        conn->tls = NULL;
+        ws_conn_free_resources(conn);
         return;
     }
     
@@ -341,9 +372,11 @@ static int ws_handle_handshake(vox_ws_connection_t* conn, const char* data, size
     char accept[64];
     int accept_len = vox_base64_encode(digest, sizeof(digest), accept, sizeof(accept));
     if (accept_len <= 0) {
+        vox_mpool_free(conn->mpool, concat);
         return -1;
     }
     accept[accept_len] = '\0';
+    vox_mpool_free(conn->mpool, concat);
     
     /* 注意：key 和 version 来自内存池，不需要 free */
     

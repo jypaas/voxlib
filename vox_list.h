@@ -108,6 +108,11 @@ typedef struct vox_list {
          &pos->member != &(list)->head; \
          pos = vox_container_of(pos->member.next, type, member))
 
+/* 兼容别名：部分代码使用 list 在前的遍历宏名 */
+#define vox_list_foreach(list, pos) vox_list_for_each(pos, list)
+#define vox_list_foreach_safe(list, pos, n) vox_list_for_each_safe(pos, n, list)
+#define vox_list_entry(ptr, type, member) vox_container_of(ptr, type, member)
+
 /* ===== 初始化函数 ===== */
 
 /**

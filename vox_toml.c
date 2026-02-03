@@ -1454,7 +1454,10 @@ vox_toml_table_t* vox_toml_parse_str(vox_mpool_t* mpool, const char* toml_str,
     
     size_t size = len;
     vox_toml_table_t* root = vox_toml_parse(mpool, buffer, &size, err_info);
-    
+    if (!root) {
+        vox_mpool_free(mpool, buffer);
+        return NULL;
+    }
     return root;
 }
 
@@ -1485,6 +1488,7 @@ vox_toml_table_t* vox_toml_parse_file(vox_mpool_t* mpool, const char* filepath,
     if (size == 0 || buffer[size] != '\0') {
         char* new_buf = (char*)vox_mpool_realloc(mpool, buffer, size + 1);
         if (!new_buf) {
+            vox_mpool_free(mpool, buffer);
             if (err_info) {
                 err_info->line = 0;
                 err_info->column = 0;
@@ -1499,7 +1503,10 @@ vox_toml_table_t* vox_toml_parse_file(vox_mpool_t* mpool, const char* filepath,
 
     size_t parse_size = size;
     vox_toml_table_t* root = vox_toml_parse(mpool, buffer, &parse_size, err_info);
-
+    if (!root) {
+        vox_mpool_free(mpool, buffer);
+        return NULL;
+    }
     return root;
 }
 

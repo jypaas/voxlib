@@ -33,6 +33,10 @@
 #else
     #include <unistd.h>
     #include <sys/stat.h>
+    #include <limits.h>
+    #ifndef PATH_MAX
+    #define PATH_MAX 4096
+    #endif
     #include <sys/types.h>
     #include <dirent.h>
     #include <fcntl.h>
@@ -168,6 +172,17 @@ int vox_file_close(vox_file_t* file) {
     vox_mpool_free(mpool, file);
     
     return ret;
+}
+
+intptr_t vox_file_get_fd(vox_file_t* file) {
+    if (!file) return (intptr_t)-1;
+#ifdef VOX_OS_WINDOWS
+    if (file->handle == INVALID_HANDLE_VALUE) return (intptr_t)-1;
+    return (intptr_t)file->handle;
+#else
+    if (file->fd < 0) return (intptr_t)-1;
+    return (intptr_t)file->fd;
+#endif
 }
 
 /* 读取文件数据 */
@@ -738,18 +753,13 @@ char* vox_file_getcwd(vox_mpool_t* mpool) {
     
     return path;
 #else
-    char* cwd = getcwd(NULL, 0);
-    if (!cwd) return NULL;
-    
-    size_t len = strlen(cwd) + 1;
+    char cwd_buf[PATH_MAX];
+    if (getcwd(cwd_buf, sizeof(cwd_buf)) == NULL) return NULL;
+
+    size_t len = strlen(cwd_buf) + 1;
     char* path = (char*)vox_mpool_alloc(mpool, len);
-    if (!path) {
-        free(cwd);  /* getcwd 分配的内存需要用 free 释放 */
-        return NULL;
-    }
-    strcpy(path, cwd);
-    free(cwd);  /* getcwd 分配的内存需要用 free 释放 */
-    
+    if (!path) return NULL;
+    memcpy(path, cwd_buf, len);
     return path;
 #endif
 }

@@ -11,6 +11,7 @@
 - **连接池**：`vox_db_pool` 管理初始/最大连接数，支持 acquire/release 与便捷的池内 exec/query
 - **事务**：同步/异步的 begin/commit/rollback
 - **协程适配**：配合 `coroutine/vox_coroutine_db.h` 使用 `*_await` 接口
+- **ORM**：`vox_orm.h/c` 提供按实体描述符的 CRUD，屏蔽占位符与方言差异，便于后期更换数据库
 
 ## 模块结构
 
@@ -20,6 +21,7 @@ db/
 ├── vox_db.c              # 抽象层实现与驱动分发
 ├── vox_db_internal.h     # 内部驱动表与连接结构（不对外）
 ├── vox_db_pool.h/c       # 连接池
+├── vox_orm.h/c           # 薄 ORM：Insert/Update/Delete/Select 单行与多行，同步与异步
 ├── vox_db_sqlite3.c      # SQLite3 驱动（VOX_USE_SQLITE3）
 ├── vox_db_duckdb.c       # DuckDB 驱动（VOX_USE_DUCKDB）
 ├── vox_db_pgsql.c        # PostgreSQL 驱动（VOX_USE_PGSQL）
@@ -58,9 +60,20 @@ if (!conn) { /* 失败，可查 vox_db_last_error(conn) 无意义，用驱动/�
 | 驱动 | conninfo 说明 |
 |------|----------------|
 | **SQLite3** | 文件路径；`":memory:"` 内存库；可选 `file:` 前缀 |
-| **DuckDB** | 文件路径；`":memory:"` 内存库 |
+| **DuckDB** | 路径或 `path;key=value;...`（支持 `encryption_key`/`password`、`motherduck_token`） |
 | **PostgreSQL** | libpq 格式，例如 `"host=127.0.0.1 port=5432 user=... dbname=... password=..."` |
 | **MySQL** | 简化 DSN：`host=... port=... user=... password=... db=... charset=...`（具体以 `vox_db_mysql.c` 为准） |
+
+### DuckDB 密码 / 认证
+
+conninfo 支持可选参数，格式为 **`path;key=value;key2=value2`**（分号分隔）：
+
+- **motherduck_token**：MotherDuck 云认证 token  
+  例：`md:your_database;motherduck_token=ey...`
+- **encryption_key** 或 **password**：本地加密库（DuckDB 1.4+）密钥  
+  例：`/path/to/file.duckdb;encryption_key=your_key` 或 `file.duckdb;password=secret`
+
+仅路径（无分号）时行为不变：`":memory:"` 或 `file.duckdb`。驱动内部用 `duckdb_open_ext` + config 传入上述选项。
 
 ### 关闭连接
 
@@ -208,6 +221,18 @@ vox_db_callback_mode_t mode = vox_db_pool_get_callback_mode(pool);
 4. **回调线程**：默认在工作线程回调；在回调里访问 loop 绑定对象时，应使用 `VOX_DB_CALLBACK_LOOP` 或自己在回调里 `vox_loop_queue_work` 切回 loop。
 5. **SQL 方言**：参数占位符（如 `?`）与 SQL 语法因驱动而异（SQLite/DuckDB 用 `?`；PG/MySQL 可能不同），请按所用驱动文档编写。
 6. **至少一个驱动**：CMake 需至少启用一个 `VOX_USE_*` DB 驱动，否则 DB 相关 API 不可用或链接失败。
+
+## ORM（vox_orm）
+
+在 `vox_db` 之上提供按实体描述符的 CRUD，自动生成各驱动兼容的 SQL（占位符 `?` / `$1,$2,...`），便于后期更换数据库。
+
+- **实体描述**：结构体 + `vox_orm_field_t` 数组（列名、类型、offset、主键、auto_gen、buffer_size）
+- **写**：`vox_orm_insert` / `vox_orm_update` / `vox_orm_delete`（同步/异步）
+- **读**：`vox_orm_select_one` / `vox_orm_select`（单行/多行，同步/异步），多行结果 push 到 `vox_vector_t*`
+- **事务**：仍使用 `vox_db_begin_transaction` / `vox_db_commit` / `vox_db_rollback`
+- **协程**：`vox_coroutine_db.h` 提供 `vox_coroutine_orm_create_table_await`、`vox_coroutine_orm_insert_await`、`vox_coroutine_orm_select_one_await`、`vox_coroutine_orm_select_await` 等，在协程内以 await 风格调用 ORM。
+
+详见 `db/ORM_DESIGN.md`。
 
 ## 依赖
 

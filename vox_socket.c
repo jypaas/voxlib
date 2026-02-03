@@ -3,7 +3,7 @@
  * 支持Windows (WinSock) 和 POSIX (BSD sockets)
  */
 
-#ifdef __APPLE__
+#ifdef VOX_OS_MACOS
 #define _DARWIN_C_SOURCE 1
 #endif
 
@@ -19,6 +19,16 @@
 #include <unistd.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#if defined(VOX_OS_LINUX)
+#include <sys/sendfile.h>
+#elif defined(VOX_OS_MACOS) || defined(VOX_OS_FREEBSD)
+#include <sys/types.h>
+#include <sys/uio.h>
+#endif
+#endif
+
+#ifdef VOX_OS_WINDOWS
+#include <windows.h>
 #endif
 
 /* 全局状态 */
@@ -471,6 +481,15 @@ uint16_t vox_socket_get_port(const vox_socket_addr_t* addr) {
     }
 }
 
+void vox_socket_set_port(vox_socket_addr_t* addr, uint16_t port) {
+    if (!addr) return;
+    if (addr->family == VOX_AF_INET) {
+        addr->u.ipv4.port = htons(port);
+    } else {
+        addr->u.ipv6.port = htons(port);
+    }
+}
+
 /* ===== TCP操作 ===== */
 
 int vox_socket_bind(vox_socket_t* sock, const vox_socket_addr_t* addr) {
@@ -591,6 +610,66 @@ int64_t vox_socket_recv(vox_socket_t* sock, void* buf, size_t len) {
     }
     
     return (int64_t)received;
+}
+
+int vox_socket_sendfile(vox_socket_t* sock, intptr_t file_fd_or_handle,
+                        int64_t offset, size_t count, size_t* out_sent) {
+    if (!sock || sock->type != VOX_SOCKET_TCP) return -1;
+    if (file_fd_or_handle == (intptr_t)-1) return -1;
+    if (sock->fd == VOX_INVALID_SOCKET) return -1;
+    if (out_sent) *out_sent = 0;
+    if (count == 0) return 0;
+
+#ifdef VOX_OS_WINDOWS
+    {
+        HANDLE hFile = (HANDLE)file_fd_or_handle;
+        SOCKET s = sock->fd;
+        char buf[65536];
+        size_t total = 0;
+        LARGE_INTEGER li;
+        li.QuadPart = offset;
+        if (SetFilePointerEx(hFile, li, NULL, FILE_BEGIN) == 0) return -1;
+        while (total < count) {
+            DWORD to_read = (DWORD)((count - total) > sizeof(buf) ? sizeof(buf) : (count - total));
+            DWORD nread = 0;
+            if (!ReadFile(hFile, buf, to_read, &nread, NULL) || nread == 0) break;
+            int nsent = send(s, buf, (int)nread, 0);
+            if (nsent == SOCKET_ERROR || nsent <= 0) break;
+            total += (size_t)nsent;
+            if ((size_t)nsent < nread) break;
+        }
+        if (out_sent) *out_sent = total;
+        return (total > 0) ? 0 : -1;
+    }
+#elif defined(VOX_OS_LINUX)
+    {
+        off_t off = (off_t)offset;
+        size_t total = 0;
+        int out_fd = (int)sock->fd;
+        int in_fd = (int)file_fd_or_handle;
+        while (total < count) {
+            size_t chunk = count - total;
+            ssize_t n = sendfile(out_fd, in_fd, &off, chunk);
+            if (n <= 0) break;
+            total += (size_t)n;
+        }
+        if (out_sent) *out_sent = total;
+        return (total > 0) ? 0 : -1;
+    }
+#elif defined(VOX_OS_MACOS) || defined(VOX_OS_FREEBSD)
+    {
+        int fd = (int)file_fd_or_handle;
+        int s = (int)sock->fd;
+        off_t len = (off_t)count;
+        int r = sendfile(fd, s, offset, &len, NULL, 0);
+        if (out_sent) *out_sent = (size_t)(r == 0 ? len : 0);
+        return (r == 0 && len > 0) ? 0 : -1;
+    }
+#else
+    (void)offset;
+    (void)count;
+    return -1;
+#endif
 }
 
 int64_t vox_socket_sendto(vox_socket_t* sock, const void* buf, size_t len, 

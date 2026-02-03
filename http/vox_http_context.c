@@ -113,11 +113,12 @@ vox_strview_t vox_http_context_param(const vox_http_context_t* ctx, const char* 
     return (vox_strview_t)VOX_STRVIEW_NULL;
 }
 
+/* header name/value 在解析提交时已 trim OWS，此处直接比较 */
 vox_strview_t vox_http_context_get_header(const vox_http_context_t* ctx, const char* name) {
     if (!ctx || !name) return (vox_strview_t)VOX_STRVIEW_NULL;
     const vox_http_request_t* req = &ctx->req;
     if (!req->headers) return (vox_strview_t)VOX_STRVIEW_NULL;
-    
+
     size_t nlen = strlen(name);
     const vox_vector_t* vec = (const vox_vector_t*)req->headers;
     size_t cnt = vox_vector_size(vec);
@@ -177,12 +178,26 @@ int vox_http_context_status(vox_http_context_t* ctx, int status) {
 
 static int vox_http_kv_push(vox_mpool_t* mpool, vox_vector_t* vec, const char* k, const char* v) {
     if (!vec || !k || !v) return -1;
+    size_t nlen = strlen(k);
+    size_t vlen = strlen(v);
     vox_http_header_t* kv = (vox_http_header_t*)vox_mpool_alloc(mpool, sizeof(vox_http_header_t));
     if (!kv) return -1;
-    kv->name = vox_strview_from_cstr(k);
-    kv->value = vox_strview_from_cstr(v);
+    char* ncopy = (char*)vox_mpool_alloc(mpool, nlen + 1);
+    char* vcopy = (char*)vox_mpool_alloc(mpool, vlen + 1);
+    if (!ncopy || !vcopy) {
+        vox_mpool_free(mpool, kv);
+        if (ncopy) vox_mpool_free(mpool, ncopy);
+        if (vcopy) vox_mpool_free(mpool, vcopy);
+        return -1;
+    }
+    memcpy(ncopy, k, nlen + 1);
+    memcpy(vcopy, v, vlen + 1);
+    kv->name = (vox_strview_t){ ncopy, nlen };
+    kv->value = (vox_strview_t){ vcopy, vlen };
     if (vox_vector_push(vec, kv) != 0) {
         vox_mpool_free(mpool, kv);
+        vox_mpool_free(mpool, ncopy);
+        vox_mpool_free(mpool, vcopy);
         return -1;
     }
     return 0;
@@ -209,6 +224,14 @@ int vox_http_context_write(vox_http_context_t* ctx, const void* data, size_t len
 int vox_http_context_write_cstr(vox_http_context_t* ctx, const char* cstr) {
     if (!cstr) return 0;
     return vox_http_context_write(ctx, cstr, strlen(cstr));
+}
+
+int vox_http_context_send_file(vox_http_context_t* ctx, void* file, int64_t offset, size_t count) {
+    if (!ctx || !file) return -1;
+    ctx->sendfile_file = (vox_file_t*)file;
+    ctx->sendfile_offset = offset;
+    ctx->sendfile_count = count;
+    return 0;
 }
 
 static void vox_http_append_status_line(vox_string_t* out, int major, int minor, int status) {
@@ -248,6 +271,8 @@ int vox_http_context_build_response(const vox_http_context_t* ctx, vox_string_t*
     /* 101 Switching Protocols：不应附带 Content-Length/Content-Type/body */
     if (status != 101) {
         size_t body_len = ctx->res.body ? vox_string_length(ctx->res.body) : 0;
+        if (ctx->sendfile_file && ctx->sendfile_count > 0)
+            body_len = ctx->sendfile_count;
 
 #ifdef VOX_USE_ZLIB
         /* 检查是否应该使用 gzip 压缩 */
@@ -310,6 +335,8 @@ int vox_http_context_build_response(const vox_http_context_t* ctx, vox_string_t*
     vox_string_append(out, "\r\n");
     if (status != 101) {
         size_t body_len = ctx->res.body ? vox_string_length(ctx->res.body) : 0;
+        if (ctx->sendfile_file && ctx->sendfile_count > 0)
+            body_len = 0;
         if (body_len > 0) {
 #ifdef VOX_USE_ZLIB
             /* 如果使用了压缩，写入压缩后的数据 */

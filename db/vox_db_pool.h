@@ -96,6 +96,14 @@ int vox_db_pool_acquire_async(vox_db_pool_t* pool,
                               void* user_data);
 
 /**
+ * 同步获取一个空闲连接（无空闲且已达 max 时返回 NULL）
+ * 用完后必须调用 vox_db_pool_release。
+ * @param pool 连接池
+ * @return 成功返回连接，失败或池满无空闲时返回 NULL
+ */
+vox_db_conn_t* vox_db_pool_acquire_sync(vox_db_pool_t* pool);
+
+/**
  * 归还连接。若该连接是临时连接，则关闭并从池中移除；否则标记为空闲供后续 acquire 使用。
  * @param pool 连接池
  * @param conn 之前通过 acquire 回调得到的连接

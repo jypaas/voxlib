@@ -105,6 +105,15 @@ static vox_db_conn_t* pool_pop_idle_locked(vox_db_pool_t* pool) {
             memset(again, 0, sizeof(*again));
             again->conn = conn;
             vox_list_push_back(&pool->idle_list, &again->node);
+        } else {
+            /* OOM：无法放回空闲列表，断开连接避免泄漏 */
+            vox_db_disconnect(conn);
+            for (size_t i = 0; i < pool->initial_size; i++) {
+                if (pool->conns[i] == conn) {
+                    pool->conns[i] = NULL;
+                    break;
+                }
+            }
         }
     }
     return NULL;
@@ -459,6 +468,15 @@ void vox_db_pool_release(vox_db_pool_t* pool, vox_db_conn_t* conn) {
             memset(cn, 0, sizeof(*cn));
             cn->conn = conn;
             vox_list_push_back(&pool->idle_list, &cn->node);
+        } else {
+            /* OOM：无法放回空闲列表，断开并清空槽位避免连接泄漏 */
+            vox_db_disconnect(conn);
+            for (size_t i = 0; i < pool->initial_size; i++) {
+                if (pool->conns[i] == conn) {
+                    pool->conns[i] = NULL;
+                    break;
+                }
+            }
         }
         pool_serve_one_waiter_locked(pool);
         vox_mutex_unlock(&pool->mu);
@@ -654,42 +672,7 @@ int vox_db_pool_query_async(vox_db_pool_t* pool,
     return 0;
 }
 
-/* 同步接口：通过 acquire 语义需在 loop 外调用，这里用“阻塞式”取连接：轮询 + 短暂 sleep 或直接同步取。
- * 当前实现：用 acquire_async + 条件等待。但 vox_db_pool 没有同步 acquire，只有 acquire_async。
- * 为保持兼容，同步 exec/query 需要“取连接”。现有代码是 pool_pop_free 同步取——我们已改为 list，
- * 所以同步取需要：尝试从 idle 取（加锁、pop、ping、解锁），没有则创建临时（会阻塞在 queue_work 里）。
- * 最简单：在 vox_db_pool_exec 里用 mutex+条件变量等待一个“有连接可用”的信号，然后 acquire_async，
- * 在回调里唤醒。这样需要 cond。或者：同步接口内部用 vox_loop_run 一次并上挂一个 acquire_async，
- * 在回调里保存 conn 并 stop loop——复杂。
- * 更简单：提供“内部同步取连接”函数：加锁，pool_pop_idle_locked（会临时解锁做 ping），
- * 若得到则返回；否则若可创建临时，则同步创建（在当前线程 vox_db_connect），然后返回。若满则等待。
- * 等待可以用 cond：release 时 signal，同步取时 wait。这样需要 vox_cond_t。检查 vox_mutex 是否有 cond...
- * 当前 vox_mutex 只有 mutex，没有 cond。所以我们用忙等：循环里 acquire_async，在回调里设置 flag 并
- * 保存 conn，主线程循环检查 flag。但那样需要运行 loop。所以同步接口只能在“已运行 loop 的线程”里用？
- * 原实现是 pool_pop_free 阻塞在锁内直到有空闲或创建了新连接，没有 cond。所以原实现里 sync exec 是
- * 可能阻塞在 pool_pop_free 里的 mutex 锁，而另一个线程（或同一线程在别处）release 会释放锁然后
- * 当前线程拿到锁并 pop。所以是“同一进程多线程”下，一个线程 sync exec（阻塞在 pop），另一个线程
- * release 或 exec_async 的 done 会 release，这样 pop 就能拿到。但我们是单 loop 线程，所以 sync exec
- * 在 loop 线程里调用会死锁（pop 要锁，release 也要锁，且 release 在 exec 的回调里，要等 exec 完成
- * 才回调，所以会死锁）。所以原来的 sync 接口本来就可能死锁在单线程 loop 里？看原代码：
- * pool_pop_free 取锁，没有 free 就创建新连接（在锁内 vox_db_connect），然后返回。所以是同步创建
- * 连接，不会等 release。所以原来没有死锁。我们新设计里 sync 取连接：加锁，pop_idle（内部会解锁做
- * ping 再加锁），没有 idle 就创建临时连接（在锁内？vox_db_connect 是同步的，可以在锁内调用）。
- * 这样就不需要 cond，和原来一样。但创建临时连接时我们在锁内调用 vox_db_connect，会阻塞。可以接受。
- * 所以实现：pool_pop_free_sync(pool) -> 返回 conn 或 NULL。内部：循环 { 锁; idle = pop_idle_locked;
- * 若 idle 返回; 若 total+pending < max 则 创建临时 conn（在锁内 connect），加入 in_use，返回 conn;
- * 否则 解锁并 sleep 一小段时间 再循环 }。没有 cond 就只能轮询。这样 sync exec/query 用
- * pool_pop_free_sync，用完后 pool_release。
- * 实现 pool_acquire_sync：加锁，pop_idle（可能临时解锁），若得到返回；否则若可创建临时，
- * pending_temp++，创建 conn（vox_db_connect），加入 in_use，返回。否则解锁，vox_thread_sleep(1ms)，
- * 重复。这样在单 loop 线程里调用会死锁吗？如果当前没有空闲且已达 max，我们会 unlock 然后 sleep，
- * 然后 relock。但没有人会 release（因为 release 在回调里，要等我们 return 后 loop 才跑）。所以
- * 会无限循环。所以 sync 接口在“已达 max 且无空闲”时必须有另一个线程 release，否则死锁。和原来
- * 一样。原来 pool_pop_free 在无空闲且 current_size >= max_size 时直接 return -1。所以原来 sync
- * 接口在池满时返回 -1。我们也可以：无空闲且满则 return NULL（-1）。这样 sync exec/query 在池满
- * 时失败。实现。
- */
-static vox_db_conn_t* pool_acquire_sync(vox_db_pool_t* pool) {
+vox_db_conn_t* vox_db_pool_acquire_sync(vox_db_pool_t* pool) {
     if (!pool) return NULL;
     for (;;) {
         if (vox_mutex_lock(&pool->mu) != 0) return NULL;
@@ -744,7 +727,7 @@ int vox_db_pool_exec(vox_db_pool_t* pool,
                      size_t nparams,
                      int64_t* out_affected_rows) {
     if (!pool || !sql) return -1;
-    vox_db_conn_t* conn = pool_acquire_sync(pool);
+    vox_db_conn_t* conn = vox_db_pool_acquire_sync(pool);
     if (!conn) return -1;
     int rc = vox_db_exec(conn, sql, params, nparams, out_affected_rows);
     vox_db_pool_release(pool, conn);
@@ -759,7 +742,7 @@ int vox_db_pool_query(vox_db_pool_t* pool,
                       void* row_user_data,
                       int64_t* out_row_count) {
     if (!pool || !sql) return -1;
-    vox_db_conn_t* conn = pool_acquire_sync(pool);
+    vox_db_conn_t* conn = vox_db_pool_acquire_sync(pool);
     if (!conn) return -1;
     int rc = vox_db_query(conn, sql, params, nparams, row_cb, row_user_data, out_row_count);
     vox_db_pool_release(pool, conn);

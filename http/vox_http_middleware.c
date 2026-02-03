@@ -793,12 +793,16 @@ vox_http_handler_cb vox_http_middleware_rate_limit_create(vox_mpool_t* mpool, co
     }
     
     if (vox_mutex_create(&limiter->mutex) != 0) {
+        if (limiter->message_copy) vox_mpool_free(mpool, limiter->message_copy);
+        vox_mpool_free(mpool, limiter);
         return NULL;
     }
     
     limiter->ip_records = vox_htable_create(mpool);
     if (!limiter->ip_records) {
         vox_mutex_destroy(&limiter->mutex);
+        if (limiter->message_copy) vox_mpool_free(mpool, limiter->message_copy);
+        vox_mpool_free(mpool, limiter);
         return NULL;
     }
     

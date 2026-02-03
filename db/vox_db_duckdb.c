@@ -1,9 +1,12 @@
 /*
  * vox_db_duckdb.c - DuckDB driver
  *
- * conninfo:
- * - ":memory:" 使用内存数据库
- * - 其他值：作为数据库文件路径
+ * conninfo 格式：
+ * - "path" 或 ":memory:"：仅路径
+ * - "path;key=value;key2=value2"：路径 + 可选参数（分号分隔）
+ * 支持的 key：encryption_key（或 password）、motherduck_token
+ * - encryption_key / password：本地加密库（1.4+）密钥
+ * - motherduck_token：MotherDuck 云认证 token
  */
 
 #include "vox_db_internal.h"
@@ -16,6 +19,7 @@
 #include <string.h>
 
 #define VOX_DUCKDB_LAST_ERROR_LEN 512
+#define VOX_DUCKDB_CONNINFO_COPY_MAX 2048
 
 typedef struct {
     duckdb_database db;
@@ -49,6 +53,40 @@ static const char* db_duckdb_last_error(vox_db_conn_t* conn) {
     return n ? n->last_error : NULL;
 }
 
+/* 解析 conninfo 中的 path 与 key=value（分号分隔），对 config 设置 encryption_key / motherduck_token。返回是否设置了任何选项。 */
+static int duckdb_parse_conninfo_and_set_config(const char* conninfo, char* path_buf, size_t path_buf_size, duckdb_config config) {
+    size_t len = strlen(conninfo);
+    if (len >= path_buf_size) return 0;
+    memcpy(path_buf, conninfo, len + 1);
+
+    char* rest = strchr(path_buf, ';');
+    if (!rest) return 0; /* 无分号，无选项 */
+    *rest = '\0';
+    rest++;
+
+    int has_option = 0;
+    while (*rest) {
+        char* next_semi = strchr(rest, ';');
+        if (next_semi) *next_semi = '\0';
+        char* eq = strchr(rest, '=');
+        if (eq && eq > rest && eq[1]) {
+            *eq = '\0';
+            char* key = rest;
+            char* val = eq + 1;
+            if (strcmp(key, "encryption_key") == 0 || strcmp(key, "password") == 0) {
+                if (duckdb_set_config(config, "encryption_key", val) == DuckDBSuccess)
+                    has_option = 1;
+            } else if (strcmp(key, "motherduck_token") == 0) {
+                if (duckdb_set_config(config, "motherduck_token", val) == DuckDBSuccess)
+                    has_option = 1;
+            }
+        }
+        if (!next_semi) break;
+        rest = next_semi + 1;
+    }
+    return has_option;
+}
+
 static int db_duckdb_connect(vox_db_conn_t* conn, const char* conninfo) {
     if (!conn || !conninfo) return -1;
 
@@ -56,15 +94,51 @@ static int db_duckdb_connect(vox_db_conn_t* conn, const char* conninfo) {
     if (!n) return -1;
     memset(n, 0, sizeof(*n));
 
-    const char* path = conninfo;
-    if (strcmp(conninfo, ":memory:") == 0) {
-        path = NULL;
+    char path_buf[VOX_DUCKDB_CONNINFO_COPY_MAX];
+    const char* path_for_open = conninfo;
+    int use_memory = (strcmp(conninfo, ":memory:") == 0);
+
+    duckdb_config config = NULL;
+    int use_ext = 0;
+    if (strchr(conninfo, ';')) {
+        if (duckdb_create_config(&config) != DuckDBSuccess) {
+            vox_mpool_free(conn->mpool, n);
+            return -1;
+        }
+        use_ext = duckdb_parse_conninfo_and_set_config(conninfo, path_buf, sizeof(path_buf), config);
+        /* 有分号时第一段一定是 path，统一用 path_buf */
+        path_for_open = path_buf;
+        use_memory = (strcmp(path_buf, ":memory:") == 0);
+        if (!use_ext) {
+            duckdb_destroy_config(&config);
+            config = NULL;
+        }
     }
 
-    if (duckdb_open(path, &n->db) != DuckDBSuccess) {
-        vox_mpool_free(conn->mpool, n);
-        return -1;
+    if (use_ext && config) {
+        char* err = NULL;
+        duckdb_state st = duckdb_open_ext(use_memory ? NULL : path_for_open, &n->db, config, &err);
+        duckdb_destroy_config(&config);
+        if (st != DuckDBSuccess) {
+            if (err && n) {
+                size_t max = sizeof(n->last_error_buf) - 1;
+                size_t elen = strlen(err);
+                if (elen > max) elen = max;
+                memcpy(n->last_error_buf, err, elen);
+                n->last_error_buf[elen] = '\0';
+                n->last_error = n->last_error_buf;
+            }
+            if (err) duckdb_free(err);
+            vox_mpool_free(conn->mpool, n);
+            return -1;
+        }
+    } else {
+        if (duckdb_open(use_memory ? NULL : path_for_open, &n->db) != DuckDBSuccess) {
+            vox_mpool_free(conn->mpool, n);
+            return -1;
+        }
     }
+
     if (duckdb_connect(n->db, &n->conn) != DuckDBSuccess) {
         duckdb_close(&n->db);
         vox_mpool_free(conn->mpool, n);
@@ -133,20 +207,46 @@ static int db_duckdb_exec(vox_db_conn_t* conn,
     vox_db_duckdb_native_t* n = get_native(conn);
     if (!n || !sql) return -1;
 
+    duckdb_result result;
+    memset(&result, 0, sizeof(result));
+
+    /* 无参数 SQL（DDL 如 DROP/CREATE SEQUENCE、CREATE TABLE）用 duckdb_query 直接执行，避免 prepare 对 DDL 的限制 */
+    if (!params || nparams == 0) {
+        duckdb_state st = duckdb_query(n->conn, sql, &result);
+        n->last_state = st;
+        if (st != DuckDBSuccess) {
+            duckdb_copy_result_error(n, &result);
+            duckdb_destroy_result(&result);
+            return -1;
+        }
+        n->last_error = NULL;
+        if (out_affected_rows) *out_affected_rows = 0;
+        duckdb_destroy_result(&result);
+        return 0;
+    }
+
     duckdb_prepared_statement stmt = NULL;
     if (duckdb_prepare(n->conn, sql, &stmt) != DuckDBSuccess) {
+        const char* err = stmt ? duckdb_prepare_error(stmt) : NULL;
+        if (err && n) {
+            size_t max = sizeof(n->last_error_buf) - 1;
+            size_t len = strlen(err);
+            if (len > max) len = max;
+            memcpy(n->last_error_buf, err, len);
+            n->last_error_buf[len] = '\0';
+            n->last_error = n->last_error_buf;
+        } else {
+            n->last_error = NULL;
+        }
+        if (stmt) duckdb_destroy_prepare(&stmt);
         return -1;
     }
 
-    if (params && nparams > 0) {
-        if (bind_params(stmt, params, nparams) != 0) {
-            duckdb_destroy_prepare(&stmt);
-            return -1;
-        }
+    if (bind_params(stmt, params, nparams) != 0) {
+        duckdb_destroy_prepare(&stmt);
+        return -1;
     }
 
-    duckdb_result result;
-    memset(&result, 0, sizeof(result));
     duckdb_state st = duckdb_execute_prepared(stmt, &result);
     duckdb_destroy_prepare(&stmt);
 
@@ -159,20 +259,9 @@ static int db_duckdb_exec(vox_db_conn_t* conn,
     n->last_error = NULL;
 
     if (out_affected_rows) {
-        /* DuckDB C API 没有直接获取变更行数的函数
-         * 尝试从result中获取：对于INSERT/UPDATE/DELETE，如果result有数据，使用row_count
-         * 否则返回0（表示无法确定） */
-        idx_t row_count = duckdb_row_count(&result);
-        idx_t col_count = duckdb_column_count(&result);
-        /* 如果result有列，说明是SELECT查询，affected_rows应该为0
-         * 如果是DML操作，通常result为空或只有元数据 */
-        if (col_count == 0 && row_count == 0) {
-            /* 可能是DML操作，但无法确定具体行数，返回0 */
-            *out_affected_rows = 0;
-        } else {
-            /* 有结果集，可能是SELECT，affected_rows为0 */
-            *out_affected_rows = 0;
-        }
+        /* INSERT/UPDATE/DELETE 用 duckdb_rows_changed；SELECT 无 affected 语义，为 0 */
+        idx_t changed = duckdb_rows_changed(&result);
+        *out_affected_rows = (int64_t)changed;
     }
 
     duckdb_destroy_result(&result);
