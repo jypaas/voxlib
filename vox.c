@@ -15,6 +15,10 @@
     #include <sys/wait.h>
     #include <fcntl.h>
     #include <signal.h>
+    #include <limits.h>
+#endif
+#if defined(VOX_OS_MACOS)
+    #include <mach-o/dyld.h>
 #endif
 
 #define VOX_VERSION_STR "1.0.0"
@@ -38,18 +42,71 @@ static const char* argv0_basename(const char* argv0) {
         }
         p = *last ? last : p;
     }
+
     return (p && *p) ? p : "vox";
 }
 
-/* 获取 CPU 核心数，用于 worker_count==0 时的默认值 */
-static uint32_t get_cpu_count(void) {
+uint32_t vox_get_cpu_count(void)
+{
 #ifdef VOX_OS_WINDOWS
     SYSTEM_INFO si;
     GetSystemInfo(&si);
-    return (uint32_t)si.dwNumberOfProcessors;
+    return (si.dwNumberOfProcessors > 0) ? (uint32_t)si.dwNumberOfProcessors : 1u;
 #else
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     return (n > 0) ? (uint32_t)n : 1u;
+#endif
+}
+
+#define VOX_EXE_PATH_MAX 4096
+
+static void exe_path_to_dir(char* path, char* buf, size_t size)
+{
+    char* last = NULL;
+    for (char* p = path; *p; p++) {
+        if (*p == '/' || *p == '\\') last = p;
+    }
+    if (last) {
+        char c = *last;
+        *last = '\0';
+        (void)snprintf(buf, size, "%s", path);
+        *last = c;
+    } else {
+        (void)snprintf(buf, size, ".");
+    }
+}
+
+int vox_get_executable_dir(char* buf, size_t size)
+{
+    if (!buf || size == 0) return -1;
+    buf[0] = '\0';
+#ifdef VOX_OS_WINDOWS
+    {
+        char path[MAX_PATH];
+        if (GetModuleFileNameA(NULL, path, sizeof(path)) == 0) return -1;
+        exe_path_to_dir(path, buf, size);
+        return 0;
+    }
+#elif defined(VOX_OS_LINUX)
+    {
+        static char path[VOX_EXE_PATH_MAX];
+        ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 1);
+        if (n <= 0) return -1;
+        path[n] = '\0';
+        exe_path_to_dir(path, buf, size);
+        return 0;
+    }
+#elif defined(VOX_OS_MACOS)
+    {
+        static char path[VOX_EXE_PATH_MAX];
+        uint32_t bufsize = sizeof(path);
+        if (_NSGetExecutablePath(path, &bufsize) != 0) return -1;
+        exe_path_to_dir(path, buf, size);
+        return 0;
+    }
+#else
+    (void)size;
+    return -1;
 #endif
 }
 
@@ -100,6 +157,17 @@ void vox_init(void)
         if (vox_socket_init() != 0) {
             return; /* socket 初始化失败，不增加引用计数 */
         }
+        /* 将当前工作目录切换到程序所在目录，使 config.toml 等相对路径相对于可执行文件目录解析 */
+        {
+            char dir[VOX_EXE_PATH_MAX];
+            if (vox_get_executable_dir(dir, sizeof(dir)) == 0) {
+#ifdef VOX_OS_WINDOWS
+                (void)SetCurrentDirectoryA(dir);
+#else
+                (void)chdir(dir);
+#endif
+            }
+        }
     }
     ++g_ref_count;
 }
@@ -129,9 +197,7 @@ static int vox_start_parse(int argc, char** argv, vox_start_options_t* out_optio
     for (int i = 1; i < argc; i++)
         parse_one(argv[i], out_options);
     if (out_options->worker_count == 0)
-        out_options->worker_count = get_cpu_count();
-    if (out_options->worker_count == 0)
-        out_options->worker_count = 1;
+        out_options->worker_count = vox_get_cpu_count();
     return 0;
 }
 
@@ -144,23 +210,23 @@ uint32_t vox_start_worker_index(void)
     return g_worker_index;
 }
 
-/* 线程模式：包装用，用于设置 TLS worker_index 后调用 worker_func */
+/* 线程模式：统一包装，worker_func 与 worker_func_ex 二选一非 NULL */
 typedef struct {
     uint32_t index;
     vox_worker_func_t worker_func;
+    vox_worker_func_ex_t worker_func_ex;
     void* user_data;
-} thread_worker_wrapper_t;
+} thread_worker_any_wrapper_t;
 
-static int thread_worker_entry(void* user_data)
+static int thread_worker_any_entry(void* user_data)
 {
-    thread_worker_wrapper_t* w = (thread_worker_wrapper_t*)user_data;
+    thread_worker_any_wrapper_t* w = (thread_worker_any_wrapper_t*)user_data;
     if (g_worker_index_key)
         vox_tls_set(g_worker_index_key, (void*)(uintptr_t)w->index);
-    return w->worker_func(w->user_data);
+    return w->worker_func_ex ? w->worker_func_ex(w->index, w->user_data) : w->worker_func(w->user_data);
 }
 
-/* 多线程模式：创建 N 个线程执行 worker_func，等待全部结束 */
-static int run_thread_mode(uint32_t n, vox_worker_func_t worker_func, void* user_data)
+static int run_thread_mode_impl(uint32_t n, vox_worker_func_t worker_func, vox_worker_func_ex_t worker_func_ex, void* user_data)
 {
     vox_mpool_config_t mcfg = {0};
     vox_mpool_t* mpool = vox_mpool_create_with_config(&mcfg);
@@ -169,7 +235,7 @@ static int run_thread_mode(uint32_t n, vox_worker_func_t worker_func, void* user
         g_start_mpool = vox_mpool_create_with_config(&(vox_mpool_config_t){0});
         if (g_start_mpool) g_worker_index_key = vox_tls_key_create(g_start_mpool, NULL);
     }
-    thread_worker_wrapper_t* wrappers = (thread_worker_wrapper_t*)vox_mpool_alloc(mpool, (size_t)n * sizeof(thread_worker_wrapper_t));
+    thread_worker_any_wrapper_t* wrappers = (thread_worker_any_wrapper_t*)vox_mpool_alloc(mpool, (size_t)n * sizeof(thread_worker_any_wrapper_t));
     if (!wrappers) { vox_mpool_destroy(mpool); return -1; }
     vox_thread_t** threads = (vox_thread_t**)vox_mpool_alloc(mpool, (size_t)n * sizeof(vox_thread_t*));
     if (!threads) {
@@ -181,66 +247,9 @@ static int run_thread_mode(uint32_t n, vox_worker_func_t worker_func, void* user
     for (uint32_t i = 0; i < n; i++) {
         wrappers[i].index = i;
         wrappers[i].worker_func = worker_func;
-        wrappers[i].user_data = user_data;
-        threads[i] = vox_thread_create(mpool, thread_worker_entry, &wrappers[i]);
-        if (!threads[i]) {
-            for (uint32_t j = 0; j < i; j++) vox_thread_join(threads[j], NULL);
-            vox_mpool_free(mpool, wrappers);
-            vox_mpool_free(mpool, threads);
-            vox_mpool_destroy(mpool);
-            return -1;
-        }
-    }
-    int first_nonzero = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        int code = 0;
-        vox_thread_join(threads[i], &code);
-        if (code != 0 && first_nonzero == 0) first_nonzero = code;
-    }
-    vox_mpool_free(mpool, wrappers);
-    vox_mpool_free(mpool, threads);
-    vox_mpool_destroy(mpool);
-    return first_nonzero;
-}
-
-/* 同上，工作函数接收 worker_index */
-typedef struct {
-    uint32_t index;
-    vox_worker_func_ex_t worker_func_ex;
-    void* user_data;
-} thread_worker_ex_wrapper_t;
-
-static int thread_worker_ex_entry(void* user_data)
-{
-    thread_worker_ex_wrapper_t* w = (thread_worker_ex_wrapper_t*)user_data;
-    if (g_worker_index_key)
-        vox_tls_set(g_worker_index_key, (void*)(uintptr_t)w->index);
-    return w->worker_func_ex(w->index, w->user_data);
-}
-
-static int run_thread_mode_ex(uint32_t n, vox_worker_func_ex_t worker_func_ex, void* user_data)
-{
-    vox_mpool_config_t mcfg = {0};
-    vox_mpool_t* mpool = vox_mpool_create_with_config(&mcfg);
-    if (!mpool) return -1;
-    if (!g_worker_index_key) {
-        g_start_mpool = vox_mpool_create_with_config(&(vox_mpool_config_t){0});
-        if (g_start_mpool) g_worker_index_key = vox_tls_key_create(g_start_mpool, NULL);
-    }
-    thread_worker_ex_wrapper_t* wrappers = (thread_worker_ex_wrapper_t*)vox_mpool_alloc(mpool, (size_t)n * sizeof(thread_worker_ex_wrapper_t));
-    if (!wrappers) { vox_mpool_destroy(mpool); return -1; }
-    vox_thread_t** threads = (vox_thread_t**)vox_mpool_alloc(mpool, (size_t)n * sizeof(vox_thread_t*));
-    if (!threads) {
-        vox_mpool_free(mpool, wrappers);
-        vox_mpool_destroy(mpool);
-        return -1;
-    }
-    memset(threads, 0, (size_t)n * sizeof(vox_thread_t*));
-    for (uint32_t i = 0; i < n; i++) {
-        wrappers[i].index = i;
         wrappers[i].worker_func_ex = worker_func_ex;
         wrappers[i].user_data = user_data;
-        threads[i] = vox_thread_create(mpool, thread_worker_ex_entry, &wrappers[i]);
+        threads[i] = vox_thread_create(mpool, thread_worker_any_entry, &wrappers[i]);
         if (!threads[i]) {
             for (uint32_t j = 0; j < i; j++) vox_thread_join(threads[j], NULL);
             vox_mpool_free(mpool, wrappers);
@@ -259,6 +268,16 @@ static int run_thread_mode_ex(uint32_t n, vox_worker_func_ex_t worker_func_ex, v
     vox_mpool_free(mpool, threads);
     vox_mpool_destroy(mpool);
     return first_nonzero;
+}
+
+VOX_UNUSED_FUNC static int run_thread_mode(uint32_t n, vox_worker_func_t worker_func, void* user_data)
+{
+    return run_thread_mode_impl(n, worker_func, NULL, user_data);
+}
+
+VOX_UNUSED_FUNC static int run_thread_mode_ex(uint32_t n, vox_worker_func_ex_t worker_func_ex, void* user_data)
+{
+    return run_thread_mode_impl(n, NULL, worker_func_ex, user_data);
 }
 
 #ifdef VOX_OS_UNIX
@@ -287,9 +306,12 @@ static int daemonize(void) {
     return 0;
 }
 
-/* 多进程模式（Unix）：fork N 次，子进程执行 worker_func 后 _exit；respawn 为 true 时 master 常驻并 SIGCHLD respawn */
-static int run_process_mode_unix(uint32_t n, const char* argv0, vox_worker_func_t worker_func, void* user_data, bool respawn,
-                                 vox_on_master_ready_t on_master_ready, void* on_master_ready_data)
+/* 多进程模式（Unix）内部实现：worker_func 与 worker_func_ex 二选一非 NULL，子进程执行后 _exit；respawn 时 master 常驻并 SIGCHLD respawn */
+static int run_process_mode_unix_impl(uint32_t n, const char* argv0,
+                                      vox_worker_func_t worker_func,
+                                      vox_worker_func_ex_t worker_func_ex,
+                                      void* user_data, bool respawn,
+                                      vox_on_master_ready_t on_master_ready, void* on_master_ready_data)
 {
     const char* prog = argv0_basename(argv0);
     char t[24];
@@ -319,7 +341,7 @@ static int run_process_mode_unix(uint32_t n, const char* argv0, vox_worker_func_
                 snprintf(wname, sizeof(wname), "%s worker", prog);
                 vox_process_setname(wname);
             }
-            int code = worker_func(user_data);
+            int code = worker_func_ex ? worker_func_ex(i, user_data) : worker_func(user_data);
             _exit(code >= 0 ? code : 255);
         }
         pids[i] = pid;
@@ -351,7 +373,7 @@ static int run_process_mode_unix(uint32_t n, const char* argv0, vox_worker_func_
                                         snprintf(wname, sizeof(wname), "%s worker", prog);
                                         vox_process_setname(wname);
                                     }
-                                    int code = worker_func(user_data);
+                                    int code = worker_func_ex ? worker_func_ex(k, user_data) : worker_func(user_data);
                                     _exit(code >= 0 ? code : 255);
                                 }
                                 if (pid > 0) pids[k] = pid;
@@ -385,101 +407,16 @@ static int run_process_mode_unix(uint32_t n, const char* argv0, vox_worker_func_
     return first_nonzero;
 }
 
-static int run_process_mode_unix_ex(uint32_t n, const char* argv0, vox_worker_func_ex_t worker_func_ex, void* user_data, bool respawn,
+VOX_UNUSED_FUNC static int run_process_mode_unix(uint32_t n, const char* argv0, vox_worker_func_t worker_func, void* user_data, bool respawn,
+                                 vox_on_master_ready_t on_master_ready, void* on_master_ready_data)
+{
+    return run_process_mode_unix_impl(n, argv0, worker_func, NULL, user_data, respawn, on_master_ready, on_master_ready_data);
+}
+
+VOX_UNUSED_FUNC static int run_process_mode_unix_ex(uint32_t n, const char* argv0, vox_worker_func_ex_t worker_func_ex, void* user_data, bool respawn,
                                     vox_on_master_ready_t on_master_ready, void* on_master_ready_data)
 {
-    const char* prog = argv0_basename(argv0);
-    char t[24];
-    snprintf(t, sizeof(t), "%s master", prog);
-    vox_process_setname(t);
-    vox_mpool_config_t mcfg = {0};
-    vox_mpool_t* mpool = vox_mpool_create_with_config(&mcfg);
-    if (!mpool) return -1;
-    pid_t* pids = (pid_t*)vox_mpool_alloc(mpool, (size_t)n * sizeof(pid_t));
-    if (!pids) {
-        vox_mpool_destroy(mpool);
-        return -1;
-    }
-    memset(pids, 0, (size_t)n * sizeof(pid_t));
-    for (uint32_t i = 0; i < n; i++) {
-        pid_t pid = fork();
-        if (pid < 0) {
-            while (i > 0) waitpid(pids[--i], NULL, 0);
-            vox_mpool_free(mpool, pids);
-            vox_mpool_destroy(mpool);
-            return -1;
-        }
-        if (pid == 0) {
-            g_worker_index = i;
-            {
-                char wname[24];
-                snprintf(wname, sizeof(wname), "%s worker", prog);
-                vox_process_setname(wname);
-            }
-            int code = worker_func_ex(i, user_data);
-            _exit(code >= 0 ? code : 255);
-        }
-        pids[i] = pid;
-    }
-    int first_nonzero = 0;
-    if (respawn) {
-        g_master_quit = 0;
-        g_sigchld_pending = 0;
-        vox_process_signal_register(SIGCHLD, on_sigchld);
-        vox_process_signal_register(SIGINT, on_master_quit);
-        vox_process_signal_register(SIGTERM, on_master_quit);
-        if (on_master_ready)
-            on_master_ready(on_master_ready_data);
-        while (!g_master_quit) {
-            if (g_sigchld_pending) {
-                g_sigchld_pending = 0;
-                for (;;) {
-                    int status = 0;
-                    pid_t dead = waitpid(-1, &status, WNOHANG);
-                    if (dead <= 0) break;
-                    for (uint32_t k = 0; k < n; k++) {
-                        if (pids[k] == dead) {
-                            if (!g_master_quit) {
-                                pid_t pid = fork();
-                                if (pid == 0) {
-                                    g_worker_index = k;
-                                    {
-                                        char wname[24];
-                                        snprintf(wname, sizeof(wname), "%s worker", prog);
-                                        vox_process_setname(wname);
-                                    }
-                                    int code = worker_func_ex(k, user_data);
-                                    _exit(code >= 0 ? code : 255);
-                                }
-                                if (pid > 0) pids[k] = pid;
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-            usleep(100000);
-        }
-        for (uint32_t i = 0; i < n; i++) {
-            if (pids[i] > 0) {
-                vox_process_signal_send((vox_process_id_t)pids[i], SIGTERM);
-                waitpid(pids[i], NULL, 0);
-            }
-        }
-    } else {
-        for (uint32_t i = 0; i < n; i++) {
-            int status = 0;
-            if (waitpid(pids[i], &status, 0) >= 0) {
-                if (WIFEXITED(status)) {
-                    int c = WEXITSTATUS(status);
-                    if (c != 0 && first_nonzero == 0) first_nonzero = c;
-                }
-            }
-        }
-    }
-    vox_mpool_free(mpool, pids);
-    vox_mpool_destroy(mpool);
-    return first_nonzero;
+    return run_process_mode_unix_impl(n, argv0, NULL, worker_func_ex, user_data, respawn, on_master_ready, on_master_ready_data);
 }
 #endif
 
@@ -540,32 +477,36 @@ static int run_process_mode_win(int argc, char** argv, uint32_t n,
 }
 #endif
 
-static int vox_start_run(int argc, char** argv,
-                         const vox_start_options_t* options,
-                         vox_worker_func_t worker_func,
-                         void* user_data,
-                         vox_on_master_ready_t on_master_ready,
-                         void* on_master_ready_data)
+/* 统一 run 入口：worker_func 与 worker_func_ex 二选一非 NULL */
+static int vox_start_run_common(int argc, char** argv,
+                                const vox_start_options_t* options,
+                                vox_worker_func_t worker_func,
+                                vox_worker_func_ex_t worker_func_ex,
+                                void* user_data,
+                                vox_on_master_ready_t on_master_ready, void* on_master_ready_data)
 {
     (void)argc;
-    if (!options || !worker_func) return -1;
-    uint32_t n = options->worker_count;
-    if (n == 0) n = get_cpu_count();
-    if (n == 0) n = 1;
+    uint32_t n = options->worker_count ? options->worker_count : vox_get_cpu_count();
     vox_init();
     int ret;
     if (options->mode == (vox_start_mode_t)VOX_START_MODE_THREAD) {
-        ret = run_thread_mode(n, worker_func, user_data);
+        ret = run_thread_mode_impl(n, worker_func, worker_func_ex, user_data);
     } else {
 #ifdef VOX_OS_UNIX
         if (options->daemon && daemonize() != 0) {
             vox_fini();
             return -1;
         }
-        ret = run_process_mode_unix(n, argv && argv[0] ? argv[0] : "vox", worker_func, user_data, options->respawn_workers,
-                                    on_master_ready, on_master_ready_data);
+        /* daemonize() 里做了 chdir("/")，这里改回程序所在目录 */
+        if (options->daemon) {
+            char dir[VOX_EXE_PATH_MAX];
+            if (vox_get_executable_dir(dir, sizeof(dir)) == 0)
+                (void)chdir(dir);
+        }
+        ret = run_process_mode_unix_impl(n, argv && argv[0] ? argv[0] : "vox",
+                worker_func, worker_func_ex, user_data, options->respawn_workers,
+                on_master_ready, on_master_ready_data);
 #else
-        (void)options;
         (void)on_master_ready;
         (void)on_master_ready_data;
         ret = run_process_mode_win(argc, argv, n, worker_func, user_data);
@@ -575,6 +516,17 @@ static int vox_start_run(int argc, char** argv,
     return ret;
 }
 
+static int vox_start_run(int argc, char** argv,
+                         const vox_start_options_t* options,
+                         vox_worker_func_t worker_func,
+                         void* user_data,
+                         vox_on_master_ready_t on_master_ready,
+                         void* on_master_ready_data)
+{
+    if (!options || !worker_func) return -1;
+    return vox_start_run_common(argc, argv, options, worker_func, NULL, user_data, on_master_ready, on_master_ready_data);
+}
+
 static int vox_start_run_ex(int argc, char** argv,
                             const vox_start_options_t* options,
                             vox_worker_func_ex_t worker_func_ex,
@@ -582,32 +534,8 @@ static int vox_start_run_ex(int argc, char** argv,
                             vox_on_master_ready_t on_master_ready,
                             void* on_master_ready_data)
 {
-    (void)argc;
     if (!options || !worker_func_ex) return -1;
-    uint32_t n = options->worker_count;
-    if (n == 0) n = get_cpu_count();
-    if (n == 0) n = 1;
-    vox_init();
-    int ret;
-    if (options->mode == (vox_start_mode_t)VOX_START_MODE_THREAD) {
-        ret = run_thread_mode_ex(n, worker_func_ex, user_data);
-    } else {
-#ifdef VOX_OS_UNIX
-        if (options->daemon && daemonize() != 0) {
-            vox_fini();
-            return -1;
-        }
-        ret = run_process_mode_unix_ex(n, argv && argv[0] ? argv[0] : "vox", worker_func_ex, user_data, options->respawn_workers,
-                                      on_master_ready, on_master_ready_data);
-#else
-        (void)options;
-        (void)on_master_ready;
-        (void)on_master_ready_data;
-        ret = run_process_mode_win(argc, argv, n, NULL, NULL);
-#endif
-    }
-    vox_fini();
-    return ret;
+    return vox_start_run_common(argc, argv, options, NULL, worker_func_ex, user_data, on_master_ready, on_master_ready_data);
 }
 
 /* 单监听+worker 模式：监听线程入口，调用用户 listener_func */
@@ -632,9 +560,7 @@ static int vox_start_run_listener_workers(const vox_start_options_t* options,
                                           void* user_data)
 {
     if (!options || !listener_func || !worker_task) return -1;
-    uint32_t n = options->worker_count;
-    if (n == 0) n = get_cpu_count();
-    if (n == 0) n = 1;
+    uint32_t n = options->worker_count ? options->worker_count : vox_get_cpu_count();
     vox_init();
     vox_loop_t* loop = vox_loop_create();
     if (!loop) { vox_fini(); return -1; }

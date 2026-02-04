@@ -142,6 +142,7 @@ set(VOX_SOURCES
     
     # 进程管理
     vox_process.c
+    vox_daemon.c
     
     # 异步IO框架 - 核心
     vox_loop.c

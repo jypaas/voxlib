@@ -56,6 +56,9 @@ extern "C" {
 /* ===== 进程 ===== */
 #include "vox_process.h"
 
+/* ===== 守护进程控制（pid 文件、stop/status/restart/reload）===== */
+#include "vox_daemon.h"
+
 /* ===== 异步 I/O 核心 ===== */
 #include "vox_backend.h"
 #include "vox_loop.h"
@@ -126,6 +129,21 @@ void vox_fini(void);
  * 返回库版本字符串，如 "1.0.0"
  */
 const char* vox_version(void);
+
+/**
+ * 获取 CPU 核心数（用于 worker/线程数默认值等）
+ * 保证至少返回 1；失败或不可用时返回 1。
+ */
+uint32_t vox_get_cpu_count(void);
+
+/**
+ * 获取当前程序可执行文件所在目录（运行目录）
+ * 将目录的绝对路径写入 buf，以 \\0 结尾。
+ * @param buf   输出缓冲区
+ * @param size  buf 的字节数，建议至少 256
+ * @return 0 成功，-1 失败或当前平台不支持（buf 内容未定义）
+ */
+int vox_get_executable_dir(char* buf, size_t size);
 
 /* ===== 启动模式：多线程 / 多进程（适合 nginx 风格网络服务）===== */
 

@@ -63,11 +63,13 @@ vox_loop_run(loop, VOX_RUN_DEFAULT);
 - **vox_http_engine_use(engine, handler)**：添加全局中间件（按注册顺序执行）
 - **vox_http_engine_group(engine, prefix)**：创建路由组，路径为 `prefix + path`
 - **vox_http_group_use(group, handler)**：组内中间件
-- **vox_http_engine_add_route(engine, method, path, handlers, count)**：添加路由；path 支持 `:param`（如 `/user/:id`），不支持 `*` 通配
+- **vox_http_engine_add_route(engine, method, path, handlers, count)**：添加路由；path 支持静态段、`:param`、单段 `*` 通配
 - **vox_http_engine_get/post(engine, path, handlers, count)**：便捷方法
 - **vox_http_group_add_route** / **vox_http_group_get/post**：组内路由
 
 路由匹配时，path 须为纯路径（不含 query）；匹配结果包含 handlers 与解析出的 `:param` 键值。
+
+**详细说明**：路径规则、路由组、中间件链顺序及完整示例见 [README_ROUTING.md](README_ROUTING.md)。
 
 ## Context（请求/响应）
 

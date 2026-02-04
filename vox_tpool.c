@@ -16,6 +16,8 @@
     #include <unistd.h>
 #endif
 
+extern uint32_t vox_get_cpu_count(void);
+
 /* 默认配置 */
 #define VOX_TPOOL_DEFAULT_THREAD_COUNT 0  /* 0表示使用CPU核心数 */
 #define VOX_TPOOL_DEFAULT_QUEUE_CAPACITY 1024
@@ -56,18 +58,6 @@ struct vox_tpool {
     vox_atomic_int_t* completed_tasks;    /* 已完成任务数 */
     vox_atomic_int_t* failed_tasks;       /* 失败任务数 */
 };
-
-/* 获取CPU核心数 */
-static size_t get_cpu_count(void) {
-#ifdef VOX_OS_WINDOWS
-    SYSTEM_INFO sysinfo;
-    GetSystemInfo(&sysinfo);
-    return (size_t)sysinfo.dwNumberOfProcessors;
-#else
-    long count = sysconf(_SC_NPROCESSORS_ONLN);
-    return (count > 0) ? (size_t)count : 1;
-#endif
-}
 
 /* 清理线程池资源（不释放线程池结构和内存池） */
 static void cleanup_tpool_resources(vox_tpool_t* tpool) {
@@ -241,13 +231,8 @@ vox_tpool_t* vox_tpool_create_with_config(const vox_tpool_config_t* config) {
     
     /* 如果线程数为0，使用CPU核心数 */
     if (thread_count == 0) {
-        thread_count = get_cpu_count();
-        if (thread_count == 0) {
-            thread_count = 1;  /* 至少1个线程 */
-        }
-        else {
-            thread_safe = 1;
-        }
+        thread_count = (size_t)vox_get_cpu_count();
+        thread_safe = 1;
     } else if (thread_count > 1) {
         thread_safe = 1;  /* 多线程需要线程安全 */
     }

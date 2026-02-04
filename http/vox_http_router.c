@@ -1,12 +1,15 @@
 /*
  * vox_http_router.c - 路由实现（Radix Tree）
- * 先搭骨架，后续在 router-radix-tree todo 中补齐完整匹配逻辑。
+ * 静态子节点使用哈希表按段 O(1) 查找，避免每层线性扫描。
  */
 
 #include "vox_http_router.h"
 #include "vox_http_internal.h"
-#include "../vox_vector.h"
+#include "../vox_htable.h"
 #include <string.h>
+
+/* 每节点静态子表初始容量（多数节点子节点很少） */
+#define VOX_HTTP_RNODE_STATIC_MAP_INIT_CAP 4
 
 typedef struct vox_http_rnode {
     bool is_param;
@@ -17,8 +20,8 @@ typedef struct vox_http_rnode {
     char* param_name;
     size_t param_name_len;
 
-    /* element: vox_http_rnode_t* */
-    vox_vector_t* static_children;
+    /* key: (segment, segment_len), value: vox_http_rnode_t* */
+    vox_htable_t* static_map;
     struct vox_http_rnode* param_child;
 
     vox_http_handler_cb* handlers;
@@ -44,32 +47,27 @@ static vox_http_rnode_t* vox_http_rnode_create(vox_mpool_t* mpool) {
     vox_http_rnode_t* n = (vox_http_rnode_t*)vox_mpool_alloc(mpool, sizeof(vox_http_rnode_t));
     if (!n) return NULL;
     memset(n, 0, sizeof(*n));
-    n->static_children = vox_vector_create(mpool);
-    if (!n->static_children) return NULL;
+    vox_htable_config_t hconf = { 0 };
+    hconf.initial_capacity = VOX_HTTP_RNODE_STATIC_MAP_INIT_CAP;
+    n->static_map = vox_htable_create_with_config(mpool, &hconf);
+    if (!n->static_map) return NULL;
     return n;
 }
 
 static vox_http_rnode_t* vox_http_rnode_find_static_child(vox_http_rnode_t* node, const char* seg, size_t seg_len) {
-    if (!node || !node->static_children) return NULL;
-    size_t cnt = vox_vector_size(node->static_children);
-    for (size_t i = 0; i < cnt; i++) {
-        vox_http_rnode_t* c = (vox_http_rnode_t*)vox_vector_get(node->static_children, i);
-        if (!c || c->is_param) continue;
-        if (c->segment_len == seg_len && seg_len > 0 && memcmp(c->segment, seg, seg_len) == 0) return c;
-        if (c->segment_len == 0 && seg_len == 0) return c;
-    }
-    return NULL;
+    if (!node || !node->static_map || seg_len == 0) return NULL;
+    return (vox_http_rnode_t*)vox_htable_get(node->static_map, seg, seg_len);
 }
 
 static vox_http_rnode_t* vox_http_rnode_add_static_child(vox_mpool_t* mpool, vox_http_rnode_t* node, const char* seg, size_t seg_len) {
-    if (!mpool || !node) return NULL;
+    if (!mpool || !node || !node->static_map || seg_len == 0) return NULL;
     vox_http_rnode_t* c = vox_http_rnode_create(mpool);
     if (!c) return NULL;
     c->is_param = false;
     c->segment = vox_http_mpool_strdup(mpool, seg, seg_len);
     c->segment_len = seg_len;
     if (!c->segment) return NULL;
-    if (vox_vector_push(node->static_children, c) != 0) return NULL;
+    if (vox_htable_set(node->static_map, c->segment, c->segment_len, c) != 0) return NULL;
     return c;
 }
 
