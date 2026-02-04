@@ -177,7 +177,7 @@ static void example_primitive_types(void) {
     vox_json_elem_t* number_elem = vox_json_get_object_value(root, "number");
     if (number_elem) {
         double num = vox_json_get_number(number_elem);
-        printf("  number = %f\n", num);
+        printf("  number = %g\n", num);
     }
     
     vox_mpool_destroy(mpool);
@@ -570,6 +570,157 @@ static void example_tabs_and_spaces(void) {
     printf("\n");
 }
 
+/* 示例10: 序列化 - 使用 vox_json_to_string，覆盖全部类型 (null/boolean/number/string/array/object) */
+static void example_serialize(void) {
+    printf("=== 示例 10: 序列化 (vox_json_to_string)，覆盖全部类型 ===\n");
+    
+    /* 包含 6 种类型: null, boolean, number, string, array, object */
+    const char* json_str =
+        "{\"v_null\":null,\"v_true\":true,\"v_false\":false,\"v_int\":42,\"v_float\":3.14,"
+        "\"v_str\":\"hello\",\"v_arr\":[1,\"a\",true,null],\"v_obj\":{\"nested\":\"value\"}}";
+    printf("原始 JSON (含 null/boolean/number/string/array/object):\n%s\n", json_str);
+    
+    vox_mpool_t* mpool = vox_mpool_create();
+    if (!mpool) {
+        fprintf(stderr, "创建内存池失败\n");
+        return;
+    }
+    
+    vox_json_err_info_t err_info;
+    vox_json_elem_t* root = vox_json_parse_str(mpool, json_str, &err_info);
+    if (!root) {
+        printf("解析错误: %s\n", err_info.message);
+        vox_mpool_destroy(mpool);
+        return;
+    }
+    
+    /* 紧凑输出 */
+    vox_string_t* compact = vox_json_to_string(mpool, root, false);
+    if (compact) {
+        printf("序列化 (紧凑): %s\n", vox_string_cstr(compact));
+    }
+    
+    /* 格式化输出 */
+    vox_string_t* pretty = vox_json_to_string(mpool, root, true);
+    if (pretty) {
+        printf("序列化 (格式化):\n%s\n", vox_string_cstr(pretty));
+    }
+    
+    vox_mpool_destroy(mpool);
+    printf("\n");
+}
+
+/* 示例11: 构建 JSON - 使用构建 API 覆盖全部类型 (null/bool/number/string/array/object) */
+static void example_builder(void) {
+    printf("=== 示例 11: 构建 JSON，覆盖全部类型 ===\n");
+    
+    vox_mpool_t* mpool = vox_mpool_create();
+    if (!mpool) {
+        fprintf(stderr, "创建内存池失败\n");
+        return;
+    }
+    
+    vox_json_elem_t* root = vox_json_new_object(mpool);
+    if (!root) {
+        fprintf(stderr, "new_object 失败\n");
+        vox_mpool_destroy(mpool);
+        return;
+    }
+    
+    /* null */
+    vox_json_object_set(mpool, root, "v_null", vox_json_new_null(mpool));
+    /* boolean: true / false */
+    vox_json_object_set(mpool, root, "v_true", vox_json_new_bool(mpool, true));
+    vox_json_object_set(mpool, root, "v_false", vox_json_new_bool(mpool, false));
+    /* number: 整数与小数 */
+    vox_json_object_set(mpool, root, "v_int", vox_json_new_number(mpool, 100));
+    vox_json_object_set(mpool, root, "v_float", vox_json_new_number(mpool, 2.718));
+    /* string */
+    vox_json_object_set(mpool, root, "v_str", vox_json_new_string_cstr(mpool, "world"));
+    /* array：内含多种类型 */
+    vox_json_elem_t* arr = vox_json_new_array(mpool);
+    vox_json_array_append(arr, vox_json_new_number(mpool, 1));
+    vox_json_array_append(arr, vox_json_new_string_cstr(mpool, "two"));
+    vox_json_array_append(arr, vox_json_new_bool(mpool, true));
+    vox_json_array_append(arr, vox_json_new_null(mpool));
+    vox_json_object_set(mpool, root, "v_arr", arr);
+    /* object：嵌套对象 */
+    vox_json_elem_t* nested = vox_json_new_object(mpool);
+    vox_json_object_set(mpool, nested, "key", vox_json_new_string_cstr(mpool, "nested_value"));
+    vox_json_object_set(mpool, root, "v_obj", nested);
+    
+    printf("构建的 JSON 树成员数: %zu (含 null/boolean/number/string/array/object)\n", vox_json_get_object_count(root));
+    
+    vox_string_t* str = vox_json_to_string(mpool, root, true);
+    if (str) {
+        printf("序列化结果:\n%s\n", vox_string_cstr(str));
+    }
+    
+    /* 演示 object_remove */
+    vox_json_object_remove(mpool, root, "v_arr");
+    vox_string_t* after_remove = vox_json_to_string(mpool, root, false);
+    if (after_remove) {
+        printf("移除 \"v_arr\" 后: %s\n", vox_string_cstr(after_remove));
+    }
+    
+    vox_mpool_destroy(mpool);
+    printf("\n");
+}
+
+/* 示例12: 解析含全部类型的 JSON -> 按类型读取 -> 再序列化 (round-trip) */
+static void example_roundtrip(void) {
+    printf("=== 示例 12: Round-trip，覆盖全部类型 ===\n");
+    
+    /* 含 null, boolean, number, string, array, object */
+    const char* json_str =
+        "{\"n\":null,\"t\":true,\"f\":false,\"num\":-99,\"str\":\"hi\","
+        "\"arr\":[0,1.5],\"obj\":{\"x\":1}}";
+    printf("原始: %s\n", json_str);
+    
+    vox_mpool_t* mpool = vox_mpool_create();
+    if (!mpool) {
+        fprintf(stderr, "创建内存池失败\n");
+        return;
+    }
+    
+    vox_json_err_info_t err_info;
+    vox_json_elem_t* root = vox_json_parse_str(mpool, json_str, &err_info);
+    if (!root) {
+        printf("解析错误: %s\n", err_info.message);
+        vox_mpool_destroy(mpool);
+        return;
+    }
+    
+    /* 按类型读取并打印，覆盖 6 种类型 */
+    vox_json_elem_t* n_val = vox_json_get_object_value(root, "n");
+    if (n_val && vox_json_is_type(n_val, VOX_JSON_NULL)) printf("  n (null): OK\n");
+    vox_json_elem_t* t_val = vox_json_get_object_value(root, "t");
+    if (t_val && vox_json_get_bool(t_val)) printf("  t (boolean): true\n");
+    vox_json_elem_t* f_val = vox_json_get_object_value(root, "f");
+    if (f_val && !vox_json_get_bool(f_val)) printf("  f (boolean): false\n");
+    vox_json_elem_t* num_val = vox_json_get_object_value(root, "num");
+    if (num_val) printf("  num (number): %lld\n", (long long)vox_json_get_int(num_val));
+    vox_json_elem_t* str_val = vox_json_get_object_value(root, "str");
+    if (str_val) {
+        vox_strview_t sv = vox_json_get_string(str_val);
+        printf("  str (string): \"%.*s\"\n", (int)sv.len, sv.ptr);
+    }
+    vox_json_elem_t* arr_val = vox_json_get_object_value(root, "arr");
+    if (arr_val && vox_json_is_type(arr_val, VOX_JSON_ARRAY))
+        printf("  arr (array): 长度 %zu\n", vox_json_get_array_count(arr_val));
+    vox_json_elem_t* obj_val = vox_json_get_object_value(root, "obj");
+    if (obj_val && vox_json_is_type(obj_val, VOX_JSON_OBJECT))
+        printf("  obj (object): 成员数 %zu\n", vox_json_get_object_count(obj_val));
+    
+    vox_string_t* out = vox_json_to_string(mpool, root, false);
+    if (out) {
+        printf("原样序列化: %s\n", vox_string_cstr(out));
+    }
+    
+    vox_mpool_destroy(mpool);
+    printf("\n");
+}
+
 int main(void) {
     printf("========================================\n");
     printf("=== JSON 解析器示例 ===\n");
@@ -584,6 +735,9 @@ int main(void) {
     example_formatted_json();
     example_mixed_format();
     example_tabs_and_spaces();
+    example_serialize();
+    example_builder();
+    example_roundtrip();
     
     printf("========================================\n");
     printf("所有示例执行完成\n");

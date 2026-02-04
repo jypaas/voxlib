@@ -6,12 +6,16 @@
 #include "vox_json.h"
 #include "vox_os.h"  /* 使用 VOX_UNUSED 宏 */
 #include "vox_file.h"
+#include "vox_string.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 #include <math.h>
 #include <stddef.h>
+#include <inttypes.h>
+#include <errno.h>
+#include <limits.h>
 
 /* ===== 内部辅助函数 ===== */
 
@@ -138,6 +142,13 @@ static vox_json_elem_t* parse_number(vox_mpool_t* mpool, vox_scanner_t* scanner,
         return NULL;
     }
     
+    /* JSON 规范：不允许前导零（如 01、-09），仅允许 0、0.xxx、0Exxx */
+    if (ptr - start >= 1 && ptr - start <= 2 && start[ptr - start - 1] == '0' &&
+        ptr < scanner->end && *ptr >= '0' && *ptr <= '9') {
+        set_error(err_info, scanner, "Leading zeros not allowed");
+        return NULL;
+    }
+    
     /* 检查小数部分 */
     if (ptr < scanner->end && *ptr == '.') {
         has_dot = true;
@@ -180,8 +191,15 @@ static vox_json_elem_t* parse_number(vox_mpool_t* mpool, vox_scanner_t* scanner,
     }
     memcpy(num_str, start, len);
     num_str[len] = '\0';
+    errno = 0;
     double value = strtod(num_str, NULL);
     vox_mpool_free(mpool, num_str);
+    
+    /* 溢出/下溢或非有限数（Inf/NaN）均视为非法 JSON 数字 */
+    if (errno == ERANGE || !isfinite(value)) {
+        set_error(err_info, scanner, errno == ERANGE ? "Number overflow or underflow" : "Number must be finite (no Inf/NaN)");
+        return NULL;
+    }
     
     /* 跳过已解析的数字 */
     vox_scanner_skip(scanner, len);
@@ -673,11 +691,28 @@ double vox_json_get_number(const vox_json_elem_t* elem) {
     return elem->u.number;
 }
 
+/* int64_t 在 double 中的安全范围：[-2^63, 2^63)，避免 (int64_t)n 未定义行为 */
+#define VOX_JSON_INT64_MIN_AS_DOUBLE  (-9223372036854775808.0)
+#define VOX_JSON_INT64_MAX_EXCL_AS_DOUBLE  (9223372036854775808.0)  /* 2^63 */
+
+bool vox_json_number_is_integer(const vox_json_elem_t* elem) {
+    if (!elem || elem->type != VOX_JSON_NUMBER) return false;
+    double n = elem->u.number;
+    if (!isfinite(n) || n < VOX_JSON_INT64_MIN_AS_DOUBLE || n >= VOX_JSON_INT64_MAX_EXCL_AS_DOUBLE)
+        return false;
+    return n == (double)(int64_t)n;
+}
+
 int64_t vox_json_get_int(const vox_json_elem_t* elem) {
     if (!elem || elem->type != VOX_JSON_NUMBER) {
         return 0;
     }
-    return (int64_t)elem->u.number;
+    double n = elem->u.number;
+    /* 类型与范围严格检查：非有限或超出 int64_t 范围时返回 0，避免未定义行为 */
+    if (!isfinite(n) || n < VOX_JSON_INT64_MIN_AS_DOUBLE || n >= VOX_JSON_INT64_MAX_EXCL_AS_DOUBLE) {
+        return 0;
+    }
+    return (int64_t)n;
 }
 
 vox_strview_t vox_json_get_string(const vox_json_elem_t* elem) {
@@ -868,4 +903,297 @@ void vox_json_print(const vox_json_elem_t* elem, int indent) {
             printf("}");
             break;
     }
+}
+
+/* ===== 序列化内部：写入上下文与 append ===== */
+
+typedef struct {
+    char* buf;
+    size_t size;
+    size_t used;
+    vox_string_t* str;  /* 非 NULL 时写入 vox_string，否则写入 buf */
+    int indent;
+    bool pretty;
+} vox_json_serialize_ctx_t;
+
+static void serialize_append(vox_json_serialize_ctx_t* ctx, const char* str, size_t len) {
+    if (ctx->str) {
+        vox_string_append_data(ctx->str, str, len);
+    } else if (ctx->buf && ctx->used + len < ctx->size) {
+        memcpy(ctx->buf + ctx->used, str, len);
+    }
+    ctx->used += len;
+}
+
+static void serialize_append_cstr(vox_json_serialize_ctx_t* ctx, const char* str) {
+    size_t len = strlen(str);
+    serialize_append(ctx, str, len);
+}
+
+static void serialize_append_indent(vox_json_serialize_ctx_t* ctx) {
+    if (!ctx->pretty) return;
+    serialize_append_cstr(ctx, "\n");
+    for (int i = 0; i < ctx->indent; i++) {
+        serialize_append_cstr(ctx, "  ");
+    }
+}
+
+/* 计算并写入转义后的字符串（含前后引号） */
+static void serialize_string_escaped(vox_json_serialize_ctx_t* ctx,
+                                      const char* ptr, size_t len) {
+    static const char hex[] = "0123456789abcdef";
+    serialize_append(ctx, "\"", 1);
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)ptr[i];
+        if (c == '"') {
+            serialize_append_cstr(ctx, "\\\"");
+        } else if (c == '\\') {
+            serialize_append_cstr(ctx, "\\\\");
+        } else if (c == '\b') {
+            serialize_append_cstr(ctx, "\\b");
+        } else if (c == '\f') {
+            serialize_append_cstr(ctx, "\\f");
+        } else if (c == '\n') {
+            serialize_append_cstr(ctx, "\\n");
+        } else if (c == '\r') {
+            serialize_append_cstr(ctx, "\\r");
+        } else if (c == '\t') {
+            serialize_append_cstr(ctx, "\\t");
+        } else if (c < 0x20) {
+            char u[] = "\\u0000";
+            u[4] = hex[c >> 4];
+            u[5] = hex[c & 0x0f];
+            serialize_append(ctx, u, 6);
+        } else {
+            serialize_append(ctx, ptr + i, 1);
+        }
+    }
+    serialize_append(ctx, "\"", 1);
+}
+
+static void serialize_value(vox_json_serialize_ctx_t* ctx, const vox_json_elem_t* elem);
+
+static void serialize_value(vox_json_serialize_ctx_t* ctx, const vox_json_elem_t* elem) {
+    if (!elem) {
+        serialize_append_cstr(ctx, "null");
+        return;
+    }
+    switch (elem->type) {
+        case VOX_JSON_NULL:
+            serialize_append_cstr(ctx, "null");
+            break;
+        case VOX_JSON_BOOLEAN:
+            serialize_append_cstr(ctx, elem->u.boolean ? "true" : "false");
+            break;
+        case VOX_JSON_NUMBER: {
+            double n = elem->u.number;
+            /* 先检查有限性与范围，再转 int64_t，避免 NaN/Inf/超大数导致未定义行为 */
+            if (isfinite(n) && n >= -9007199254740991.0 && n <= 9007199254740991.0 &&
+                n == (double)(int64_t)n) {
+                char num[32];
+                int sz = snprintf(num, sizeof(num), "%" PRId64, (int64_t)n);
+                if (sz > 0 && (size_t)sz < sizeof(num)) {
+                    serialize_append(ctx, num, (size_t)sz);
+                } else {
+                    serialize_append_cstr(ctx, "0");
+                }
+            } else {
+                /* 使用 %.15g：兼顾可读性与精度，常见小数如 3.14、2.718 输出简洁 */
+                char num[64];
+                int sz = snprintf(num, sizeof(num), "%.15g", n);
+                if (sz > 0 && (size_t)sz < sizeof(num)) {
+                    serialize_append(ctx, num, (size_t)sz);
+                } else {
+                    serialize_append_cstr(ctx, "0");
+                }
+            }
+            break;
+        }
+        case VOX_JSON_STRING:
+            serialize_string_escaped(ctx, elem->u.string.ptr, elem->u.string.len);
+            break;
+        case VOX_JSON_ARRAY: {
+            serialize_append(ctx, "[", 1);
+            ctx->indent += (ctx->pretty ? 1 : 0);
+            vox_json_elem_t* item;
+            vox_list_node_t* node;
+            bool first = true;
+            vox_list_for_each(node, &elem->u.array.list) {
+                item = vox_container_of(node, vox_json_elem_t, node);
+                if (!first) serialize_append(ctx, ",", 1);
+                if (ctx->pretty) serialize_append_indent(ctx);
+                serialize_value(ctx, item);
+                first = false;
+            }
+            ctx->indent -= (ctx->pretty ? 1 : 0);
+            if (ctx->pretty && !first) serialize_append_indent(ctx);
+            serialize_append(ctx, "]", 1);
+            break;
+        }
+        case VOX_JSON_OBJECT: {
+            serialize_append(ctx, "{", 1);
+            ctx->indent += (ctx->pretty ? 1 : 0);
+            vox_json_member_t* member;
+            bool first = true;
+            vox_list_for_each_entry(member, &elem->u.object.list, vox_json_member_t, node) {
+                if (!first) serialize_append(ctx, ",", 1);
+                if (ctx->pretty) serialize_append_indent(ctx);
+                serialize_string_escaped(ctx, member->name.ptr, member->name.len);
+                serialize_append_cstr(ctx, ctx->pretty ? ": " : ":");
+                serialize_value(ctx, member->value);
+                first = false;
+            }
+            ctx->indent -= (ctx->pretty ? 1 : 0);
+            if (ctx->pretty && !first) serialize_append_indent(ctx);
+            serialize_append(ctx, "}", 1);
+            break;
+        }
+    }
+}
+
+vox_string_t* vox_json_to_string(vox_mpool_t* mpool, const vox_json_elem_t* elem, bool pretty) {
+    if (!mpool) return NULL;
+    vox_string_t* str = vox_string_create(mpool);
+    if (!str) return NULL;
+    vox_json_serialize_ctx_t ctx = {
+        .buf = NULL,
+        .size = 0,
+        .used = 0,
+        .str = str,
+        .indent = 0,
+        .pretty = pretty
+    };
+    serialize_value(&ctx, elem);
+    return str;
+}
+
+int vox_json_serialize(const vox_json_elem_t* elem, char* buffer, size_t size,
+                       size_t* written, bool pretty) {
+    if (!written) return -1;
+    vox_json_serialize_ctx_t ctx = {
+        .buf = buffer,
+        .size = size,
+        .used = 0,
+        .str = NULL,
+        .indent = 0,
+        .pretty = pretty
+    };
+    serialize_value(&ctx, elem);
+    *written = ctx.used;
+    if (buffer && size > ctx.used) {
+        buffer[ctx.used] = '\0';
+        return 0;
+    }
+    if (buffer && size > 0) {
+        if (size > 0) buffer[0] = '\0';
+        return -1; /* 空间不足 */
+    }
+    return 0; /* 仅计算长度 */
+}
+
+/* ===== 构建接口实现 ===== */
+
+static vox_json_elem_t* new_elem(vox_mpool_t* mpool, vox_json_type_t type) {
+    vox_json_elem_t* elem = (vox_json_elem_t*)vox_mpool_alloc(mpool, sizeof(vox_json_elem_t));
+    if (!elem) return NULL;
+    memset(elem, 0, sizeof(vox_json_elem_t));
+    elem->type = type;
+    elem->parent = NULL;
+    vox_list_node_init(&elem->node);
+    return elem;
+}
+
+vox_json_elem_t* vox_json_new_null(vox_mpool_t* mpool) {
+    return new_elem(mpool, VOX_JSON_NULL);
+}
+
+vox_json_elem_t* vox_json_new_bool(vox_mpool_t* mpool, bool value) {
+    vox_json_elem_t* elem = new_elem(mpool, VOX_JSON_BOOLEAN);
+    if (elem) elem->u.boolean = value;
+    return elem;
+}
+
+vox_json_elem_t* vox_json_new_number(vox_mpool_t* mpool, double value) {
+    vox_json_elem_t* elem = new_elem(mpool, VOX_JSON_NUMBER);
+    if (elem) elem->u.number = value;
+    return elem;
+}
+
+vox_json_elem_t* vox_json_new_string(vox_mpool_t* mpool, const char* str, size_t len) {
+    if (!str && len > 0) return NULL;
+    char* copy = (char*)vox_mpool_alloc(mpool, len + 1);
+    if (!copy) return NULL;
+    if (str) memcpy(copy, str, len);
+    copy[len] = '\0';
+    vox_json_elem_t* elem = new_elem(mpool, VOX_JSON_STRING);
+    if (!elem) {
+        vox_mpool_free(mpool, copy);
+        return NULL;
+    }
+    elem->u.string.ptr = copy;
+    elem->u.string.len = len;
+    return elem;
+}
+
+vox_json_elem_t* vox_json_new_string_cstr(vox_mpool_t* mpool, const char* cstr) {
+    if (!cstr) return vox_json_new_string(mpool, NULL, 0);
+    return vox_json_new_string(mpool, cstr, strlen(cstr));
+}
+
+vox_json_elem_t* vox_json_new_array(vox_mpool_t* mpool) {
+    vox_json_elem_t* elem = new_elem(mpool, VOX_JSON_ARRAY);
+    if (elem) vox_list_init(&elem->u.array.list);
+    return elem;
+}
+
+vox_json_elem_t* vox_json_new_object(vox_mpool_t* mpool) {
+    vox_json_elem_t* elem = new_elem(mpool, VOX_JSON_OBJECT);
+    if (elem) vox_list_init(&elem->u.object.list);
+    return elem;
+}
+
+int vox_json_array_append(vox_json_elem_t* array_elem, vox_json_elem_t* value_elem) {
+    if (!array_elem || array_elem->type != VOX_JSON_ARRAY || !value_elem) return -1;
+    value_elem->parent = array_elem;
+    vox_list_push_back(&array_elem->u.array.list, &value_elem->node);
+    return 0;
+}
+
+int vox_json_object_set(vox_mpool_t* mpool, vox_json_elem_t* object_elem,
+                        const char* name, vox_json_elem_t* value_elem) {
+    if (!mpool || !object_elem || object_elem->type != VOX_JSON_OBJECT || !name || !value_elem)
+        return -1;
+    size_t name_len = strlen(name);
+    vox_json_member_t* old = vox_json_get_object_member(object_elem, name);
+    if (old) {
+        vox_list_remove(&object_elem->u.object.list, &old->node);
+        vox_mpool_free(mpool, old);
+    }
+    char* key_copy = (char*)vox_mpool_alloc(mpool, name_len + 1);
+    if (!key_copy) return -1;
+    memcpy(key_copy, name, name_len + 1);
+    vox_json_member_t* member = (vox_json_member_t*)vox_mpool_alloc(mpool, sizeof(vox_json_member_t));
+    if (!member) {
+        vox_mpool_free(mpool, key_copy);
+        return -1;
+    }
+    vox_list_node_init(&member->node);
+    member->name.ptr = key_copy;
+    member->name.len = name_len;
+    member->value = value_elem;
+    value_elem->parent = object_elem;
+    vox_list_push_back(&object_elem->u.object.list, &member->node);
+    return 0;
+}
+
+int vox_json_object_remove(vox_mpool_t* mpool, vox_json_elem_t* object_elem,
+                           const char* name) {
+    if (!mpool || !object_elem || object_elem->type != VOX_JSON_OBJECT || !name)
+        return -1;
+    vox_json_member_t* member = vox_json_get_object_member(object_elem, name);
+    if (!member) return -1;
+    vox_list_remove(&object_elem->u.object.list, &member->node);
+    /* 不释放 member->name.ptr：解析得到的对象其键指向原 buffer；构建得到的由 mpool 统一释放 */
+    vox_mpool_free(mpool, member);
+    return 0;
 }

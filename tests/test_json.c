@@ -199,9 +199,9 @@ static void test_json_scientific_notation(vox_mpool_t* mpool) {
     TEST_ASSERT_NOT_NULL(elem1, "解析科学计数法失败");
     TEST_ASSERT_EQ(vox_json_get_type(elem1), VOX_JSON_NUMBER, "类型应为NUMBER");
     
-    /* 测试大数字 */
+    /* 测试大数字（在 double 整数精度内，避免平台 ERANGE 差异） */
     char* json2 = (char*)vox_mpool_alloc(mpool, 100);
-    strcpy(json2, "12345678901234567890");
+    strcpy(json2, "1234567890123456");
     size_t size2 = strlen(json2);
     vox_json_elem_t* elem2 = vox_json_parse(mpool, json2, &size2, NULL);
     TEST_ASSERT_NOT_NULL(elem2, "解析大数字失败");
@@ -317,6 +317,105 @@ static void test_json_boundary_values(vox_mpool_t* mpool) {
     TEST_ASSERT_EQ(str.len, 0, "空字符串长度应为0");
 }
 
+/* 测试序列化 */
+static void test_json_serialize(vox_mpool_t* mpool) {
+    char* json = (char*)vox_mpool_alloc(mpool, 256);
+    strcpy(json, "{\"a\":1,\"b\":[2,3],\"c\":\"hi\"}");
+    size_t size = strlen(json);
+    vox_json_elem_t* elem = vox_json_parse(mpool, json, &size, NULL);
+    TEST_ASSERT_NOT_NULL(elem, "解析失败");
+    
+    /* 使用 vox_json_to_string（推荐） */
+    vox_string_t* str = vox_json_to_string(mpool, elem, false);
+    TEST_ASSERT_NOT_NULL(str, "vox_json_to_string 应成功");
+    const char* cstr = vox_string_cstr(str);
+    TEST_ASSERT_NOT_NULL(cstr, "cstr 非空");
+    TEST_ASSERT_TRUE(strchr(cstr, 'a') != NULL, "输出应含键a");
+    TEST_ASSERT_TRUE(strchr(cstr, '1') != NULL, "输出应含值1");
+    
+    vox_string_t* str_pretty = vox_json_to_string(mpool, elem, true);
+    TEST_ASSERT_NOT_NULL(str_pretty, "vox_json_to_string pretty 应成功");
+    TEST_ASSERT_TRUE(strchr(vox_string_cstr(str_pretty), '\n') != NULL, "pretty 应含换行");
+    
+    /* 兼容：固定缓冲区序列化 */
+    size_t written = 0;
+    int ret = vox_json_serialize(elem, NULL, 0, &written, false);
+    TEST_ASSERT_EQ(ret, 0, "计算长度应成功");
+    TEST_ASSERT_TRUE(written > 0, "长度应大于0");
+    char* buf = (char*)vox_mpool_alloc(mpool, written + 1);
+    ret = vox_json_serialize(elem, buf, written + 1, &written, false);
+    TEST_ASSERT_EQ(ret, 0, "序列化应成功");
+}
+
+/* 测试构建 API */
+static void test_json_builder(vox_mpool_t* mpool) {
+    vox_json_elem_t* root = vox_json_new_object(mpool);
+    TEST_ASSERT_NOT_NULL(root, "new_object 失败");
+    TEST_ASSERT_EQ(vox_json_get_type(root), VOX_JSON_OBJECT, "类型应为 OBJECT");
+    
+    vox_json_elem_t* n = vox_json_new_number(mpool, 42);
+    TEST_ASSERT_EQ(vox_json_object_set(mpool, root, "num", n), 0, "object_set 失败");
+    vox_json_elem_t* s = vox_json_new_string_cstr(mpool, "hello");
+    TEST_ASSERT_EQ(vox_json_object_set(mpool, root, "str", s), 0, "object_set str 失败");
+    vox_json_elem_t* arr = vox_json_new_array(mpool);
+    vox_json_array_append(arr, vox_json_new_number(mpool, 1));
+    vox_json_array_append(arr, vox_json_new_number(mpool, 2));
+    TEST_ASSERT_EQ(vox_json_object_set(mpool, root, "arr", arr), 0, "object_set arr 失败");
+    
+    TEST_ASSERT_EQ(vox_json_get_object_count(root), 3, "应有3个成员");
+    vox_json_elem_t* num_val = vox_json_get_object_value(root, "num");
+    TEST_ASSERT_NOT_NULL(num_val, "应能取到 num");
+    TEST_ASSERT_EQ(vox_json_get_int(num_val), 42, "num 应为 42");
+    vox_json_elem_t* str_val = vox_json_get_object_value(root, "str");
+    vox_strview_t str_sv = vox_json_get_string(str_val);
+    TEST_ASSERT_TRUE(vox_strview_compare_cstr(&str_sv, "hello") == 0, "str 应为 hello");
+    vox_json_elem_t* arr_val = vox_json_get_object_value(root, "arr");
+    TEST_ASSERT_EQ(vox_json_get_array_count(arr_val), 2, "arr 应有2个元素");
+    
+    vox_string_t* str = vox_json_to_string(mpool, root, false);
+    TEST_ASSERT_NOT_NULL(str, "vox_json_to_string 应成功");
+    const char* buf = vox_string_cstr(str);
+    TEST_ASSERT_TRUE(strstr(buf, "\"num\":42") != NULL || strstr(buf, "\"num\": 42") != NULL, "序列化应含 num");
+    TEST_ASSERT_TRUE(strstr(buf, "hello") != NULL, "序列化应含 hello");
+    
+    TEST_ASSERT_EQ(vox_json_object_remove(mpool, root, "str"), 0, "remove 应成功");
+    TEST_ASSERT_EQ(vox_json_get_object_count(root), 2, "移除后应有2个成员");
+    TEST_ASSERT_NULL(vox_json_get_object_value(root, "str"), "str 应已被移除");
+}
+
+/* 测试数字与类型严格检查：前导零拒绝、number_is_integer、get_int 越界 */
+static void test_json_strict_number(vox_mpool_t* mpool) {
+    /* 前导零应解析失败 */
+    char* json_lead = (char*)vox_mpool_alloc(mpool, 32);
+    strcpy(json_lead, "01");
+    size_t sz = strlen(json_lead);
+    vox_json_err_info_t err_info;
+    vox_json_elem_t* e = vox_json_parse(mpool, json_lead, &sz, &err_info);
+    TEST_ASSERT_NULL(e, "前导零 01 应解析失败");
+    TEST_ASSERT_TRUE(err_info.message != NULL && strstr(err_info.message, "Leading") != NULL, "应报前导零错误");
+
+    /* 合法整数：number_is_integer 为 true，get_int 正确 */
+    char* json_ok = (char*)vox_mpool_alloc(mpool, 32);
+    strcpy(json_ok, "42");
+    sz = strlen(json_ok);
+    e = vox_json_parse(mpool, json_ok, &sz, NULL);
+    TEST_ASSERT_NOT_NULL(e, "解析 42 应成功");
+    TEST_ASSERT_TRUE(vox_json_number_is_integer(e), "42 应为整数");
+    TEST_ASSERT_EQ(vox_json_get_int(e), 42, "get_int 42");
+
+    /* 小数：number_is_integer 为 false，get_int 截断 */
+    strcpy(json_ok, "3.14");
+    sz = strlen(json_ok);
+    e = vox_json_parse(mpool, json_ok, &sz, NULL);
+    TEST_ASSERT_NOT_NULL(e, "解析 3.14 应成功");
+    TEST_ASSERT_FALSE(vox_json_number_is_integer(e), "3.14 不应为整数");
+    TEST_ASSERT_EQ(vox_json_get_int(e), 3, "get_int 截断为 3");
+
+    /* 非 NUMBER 类型调用 get_int 返回 0 */
+    vox_json_elem_t* s = vox_json_new_string_cstr(mpool, "x");
+    TEST_ASSERT_EQ(vox_json_get_int((const vox_json_elem_t*)s), 0, "string 上 get_int 应返回 0");
+}
+
 /* 测试套件 */
 test_case_t test_json_cases[] = {
     {"parse_simple", test_json_parse_simple},
@@ -333,6 +432,9 @@ test_case_t test_json_cases[] = {
     {"empty_structures", test_json_empty_structures},
     {"complex_nested", test_json_complex_nested},
     {"boundary_values", test_json_boundary_values},
+    {"serialize", test_json_serialize},
+    {"builder", test_json_builder},
+    {"strict_number", test_json_strict_number},
 };
 
 test_suite_t test_json_suite = {

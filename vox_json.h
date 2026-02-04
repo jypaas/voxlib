@@ -10,6 +10,7 @@
 #include "vox_scanner.h"
 #include "vox_mpool.h"
 #include "vox_list.h"
+#include "vox_string.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -162,9 +163,17 @@ bool vox_json_get_bool(const vox_json_elem_t* elem);
 double vox_json_get_number(const vox_json_elem_t* elem);
 
 /**
- * 获取整数值（从数字类型）
+ * 判断数字是否为可安全转换为 int64_t 的整数值（有限、在 [INT64_MIN,INT64_MAX] 内且无小数部分）
  * @param elem JSON 元素指针（必须是 VOX_JSON_NUMBER 类型）
- * @return 返回整数值，如果类型不匹配返回 0
+ * @return 是则返回 true，否则返回 false
+ */
+bool vox_json_number_is_integer(const vox_json_elem_t* elem);
+
+/**
+ * 获取整数值（从数字类型）
+ * 类型非 NUMBER、非有限、或超出 int64_t 范围时返回 0；小数会截断（建议先用 vox_json_number_is_integer 校验）
+ * @param elem JSON 元素指针（必须是 VOX_JSON_NUMBER 类型）
+ * @return 返回整数值，若类型不匹配或越界返回 0
  */
 int64_t vox_json_get_int(const vox_json_elem_t* elem);
 
@@ -253,6 +262,98 @@ vox_json_member_t* vox_json_object_next(const vox_json_member_t* member);
  * @param indent 缩进级别（用于格式化输出）
  */
 void vox_json_print(const vox_json_elem_t* elem, int indent);
+
+/* ===== 序列化接口 ===== */
+
+/**
+ * 将 JSON 元素序列化为 vox_string_t（推荐）
+ * 内存由 mpool 管理，随 mpool 释放；可用 vox_string_cstr() 取 C 字符串。
+ * @param mpool 内存池，不可为 NULL
+ * @param elem JSON 元素指针（可为 NULL，输出 "null"）
+ * @param pretty 是否格式化输出（换行与缩进）
+ * @return 成功返回字符串对象指针，失败返回 NULL，可用 vox_string_destroy() 释放
+ */
+vox_string_t* vox_json_to_string(vox_mpool_t* mpool, const vox_json_elem_t* elem, bool pretty);
+
+/**
+ * 将 JSON 元素序列化到固定缓冲区
+ * @param elem JSON 元素指针（可为 NULL，输出 "null"）
+ * @param buffer 输出缓冲区（可为 NULL，仅计算长度）
+ * @param size 缓冲区大小（含结尾 '\0'）
+ * @param written 输出实际长度（不含 '\0'），不可为 NULL
+ * @param pretty 是否格式化输出（换行与缩进）
+ * @return 成功返回 0；buffer 非 NULL 且空间不足返回 -1（此时 written 为所需长度）
+ */
+int vox_json_serialize(const vox_json_elem_t* elem, char* buffer, size_t size,
+                       size_t* written, bool pretty);
+
+/* ===== 构建接口 ===== */
+
+/**
+ * 创建 JSON null 值
+ */
+vox_json_elem_t* vox_json_new_null(vox_mpool_t* mpool);
+
+/**
+ * 创建 JSON 布尔值
+ */
+vox_json_elem_t* vox_json_new_bool(vox_mpool_t* mpool, bool value);
+
+/**
+ * 创建 JSON 数字
+ */
+vox_json_elem_t* vox_json_new_number(vox_mpool_t* mpool, double value);
+
+/**
+ * 创建 JSON 字符串（复制 str 的 len 字节到 mpool）
+ * @param str 字符串指针
+ * @param len 长度（字节数）
+ */
+vox_json_elem_t* vox_json_new_string(vox_mpool_t* mpool, const char* str, size_t len);
+
+/**
+ * 创建 JSON 字符串（从 C 字符串复制，以 '\0' 结尾）
+ */
+vox_json_elem_t* vox_json_new_string_cstr(vox_mpool_t* mpool, const char* cstr);
+
+/**
+ * 创建空 JSON 数组
+ */
+vox_json_elem_t* vox_json_new_array(vox_mpool_t* mpool);
+
+/**
+ * 创建空 JSON 对象
+ */
+vox_json_elem_t* vox_json_new_object(vox_mpool_t* mpool);
+
+/**
+ * 向数组末尾追加元素
+ * @param array_elem 必须是 VOX_JSON_ARRAY 类型
+ * @param value_elem 要追加的元素（其 parent 会被设为 array_elem）
+ * @return 成功返回 0，失败返回 -1
+ */
+int vox_json_array_append(vox_json_elem_t* array_elem, vox_json_elem_t* value_elem);
+
+/**
+ * 设置对象成员（若键已存在则替换）
+ * @param mpool 用于分配键名副本和 member 结构
+ * @param object_elem 必须是 VOX_JSON_OBJECT 类型
+ * @param name 成员键名（会被复制到 mpool）
+ * @param value_elem 成员值（其 parent 会被设为 object_elem）
+ * @return 成功返回 0，失败返回 -1
+ */
+int vox_json_object_set(vox_mpool_t* mpool, vox_json_elem_t* object_elem,
+                        const char* name, vox_json_elem_t* value_elem);
+
+/**
+ * 移除对象中指定键的成员（不释放 value_elem，仅解除链接）
+ * @param mpool 用于释放 member 结构及键名副本
+ * @param object_elem 必须是 VOX_JSON_OBJECT 类型
+ * @param name 成员键名
+ * @return 找到并移除返回 0，未找到返回 -1
+ */
+int vox_json_object_remove(vox_mpool_t* mpool, vox_json_elem_t* object_elem,
+                           const char* name);
 
 #ifdef __cplusplus
 }
