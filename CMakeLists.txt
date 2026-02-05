@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.10)
 
+# 允许子目录向主目标添加源与链接库
+cmake_policy(SET CMP0076 NEW)   # target_sources 接受来自其他目录的相对路径
+cmake_policy(SET CMP0079 NEW)   # target_link_libraries 可链接由其他目录创建的目标
+
 # Enable ASM language for Unix platforms (x86_64/ARM64 context switching)
 if(NOT WIN32)
     project(vox VERSION 1.0.0 LANGUAGES C ASM)
@@ -86,7 +90,15 @@ option(VOX_USE_WOLFSSL "Use WolfSSL for TLS support" OFF)
 option(VOX_USE_MBEDTLS "Use mbedTLS for TLS support" OFF)
 option(VOX_USE_ZLIB "Use zlib for gzip compression" ON)
 
-# ===== DB 支持（可选）=====
+# ===== 模块开关（按需编译各模块）=====
+option(VOX_USE_COROUTINE "Build coroutine module" ON)
+option(VOX_USE_SSL "Build SSL/TLS module" ON)
+option(VOX_USE_HTTP "Build HTTP module" ON)
+option(VOX_USE_WEBSOCKET "Build WebSocket module" ON)
+option(VOX_USE_REDIS "Build Redis module" ON)
+option(VOX_USE_DB "Build DB module" ON)
+
+# ===== DB 支持（可选，仅当 VOX_USE_DB=ON 时有效）=====
 option(VOX_USE_SQLITE3 "Use SQLite3 for DB support" ON)
 option(VOX_USE_DUCKDB "Use DuckDB for DB support" OFF)
 option(VOX_USE_PGSQL "Use PostgreSQL (libpq) for DB support" OFF)
@@ -96,11 +108,9 @@ option(VOX_USE_MYSQL "Use MySQL (libmysqlclient) for DB support" OFF)
 #include_directories(${PROJECT_SOURCE_DIR}/include)
 #include_directories(${PROJECT_SOURCE_DIR}/coroutine)
 
-# ===== 源文件列表 =====
+# ===== 核心源文件（始终编译；各模块由子目录 CMakeLists 按开关添加）=====
 set(VOX_SOURCES
-    # 统一入口（vox.h 为单头文件入口，vox.c 占位）
     vox.c
-    # 核心数据结构
     vox_mpool.c
     vox_htable.c
     vox_rbtree.c
@@ -108,138 +118,43 @@ set(VOX_SOURCES
     vox_vector.c
     vox_string.c
     vox_queue.c
-    
-    # 文件系统
     vox_file.c
-    
-    # 时间处理
     vox_time.c
-    
-    # 日志
     vox_log.c
-    
-    # 线程和并发
     vox_thread.c
     vox_mutex.c
     vox_atomic.c
     vox_tpool.c
-    
-    # 网络
     vox_socket.c
-    
-    # 加密
     vox_crypto.c
-    
-    # 文本处理
     vox_scanner.c
     vox_regex.c
     vox_json.c
     vox_xml.c
     vox_toml.c
-    
-    # Backend 实现
     vox_select.c
-    
-    # 进程管理
     vox_process.c
     vox_daemon.c
-    
-    # 异步IO框架 - 核心
     vox_loop.c
     vox_timer.c
     vox_backend.c
     vox_handle.c
-    
-    # 异步IO框架 - 网络
     vox_tcp.c
     vox_udp.c
     vox_dns.c
-    
-    # 异步IO框架 - 文件
     vox_fs.c
-    
-    # 协程系统
-    coroutine/vox_coroutine.c
-    coroutine/vox_coroutine_promise.c
-    coroutine/vox_coroutine_pool.c
-    coroutine/vox_coroutine_scheduler.c
-    coroutine/vox_coroutine_db.c
-    coroutine/vox_coroutine_dns.c
-    coroutine/vox_coroutine_fs.c
-    coroutine/vox_coroutine_redis.c
-    coroutine/vox_coroutine_http.c
-    coroutine/vox_coroutine_ws.c
-    
-    # SSL/TLS 支持
-    ssl/vox_ssl.c
-    vox_tls.c
-    vox_dtls.c
-
-    # HTTP 支持
-    http/vox_http_parser.c
-    http/vox_http_multipart_parser.c
-    http/vox_http_context.c
-    http/vox_http_router.c
-    http/vox_http_engine.c
-    http/vox_http_server.c
-    http/vox_http_ws.c
-    http/vox_http_client.c
-    http/vox_http_gzip.c
-    http/vox_http_mime.c
-    http/vox_http_middleware.c
-
-    # WebSocket 支持
-    websocket/vox_websocket.c
-    websocket/vox_websocket_server.c
-    websocket/vox_websocket_client.c
-
-    # Redis 支持
-    redis/vox_redis_parser.c
-    redis/vox_redis_client.c
-    redis/vox_redis_pool.c
-
-    # DB 模块（核心始终编译；驱动按需启用）
-    db/vox_db.c
-    db/vox_db_pool.c
-    db/vox_orm.c
 )
 
 # ===== 平台特定的源文件 =====
-# 注意：backend文件内部已有条件编译保护，但为了清晰，我们按平台添加
 if(WIN32)
     list(APPEND VOX_SOURCES vox_iocp.c)
 elseif(APPLE)
     list(APPEND VOX_SOURCES vox_kqueue.c)
 elseif(UNIX)
     list(APPEND VOX_SOURCES vox_epoll.c)
-    # io_uring 是可选的，需要库支持
     if(VOX_USE_IOURING)
         list(APPEND VOX_SOURCES vox_uring.c)
     endif()
-endif()
-
-# ===== 协程上下文切换实现 =====
-if(WIN32)
-    list(APPEND VOX_SOURCES coroutine/vox_coroutine_context_win.c)
-else()
-    # Unix: 使用汇编实现 (x86_64/ARM64) 或 ucontext 回退
-    list(APPEND VOX_SOURCES coroutine/vox_coroutine_context_asm.c)
-
-    # 添加汇编文件 (根据架构)
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
-        list(APPEND VOX_SOURCES coroutine/vox_coroutine_context_x64.S)
-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
-        list(APPEND VOX_SOURCES coroutine/vox_coroutine_context_arm64.S)
-    endif()
-endif()
-
-# ===== SSL 库源文件 =====
-if(VOX_USE_OPENSSL)
-    list(APPEND VOX_SOURCES ssl/vox_ssl_openssl.c)
-elseif(VOX_USE_WOLFSSL)
-    # list(APPEND VOX_SOURCES ssl/vox_ssl_wolfssl.c)
-elseif(VOX_USE_MBEDTLS)
-    # list(APPEND VOX_SOURCES ssl/vox_ssl_mbedtls.c)
 endif()
 
 # ===== 构建库 =====
@@ -253,112 +168,27 @@ else()
     add_library(vox STATIC ${VOX_SOURCES})
 endif()
 
-if(VOX_USE_SQLITE3)
-    # 优先使用 FindSQLite3
-    find_package(SQLite3 QUIET)
-    if(SQLite3_FOUND)
-        target_sources(vox PRIVATE db/vox_db_sqlite3.c)
-        target_compile_definitions(vox PRIVATE VOX_USE_SQLITE3=1)
-        if(TARGET SQLite3::SQLite3)
-            target_link_libraries(vox PRIVATE SQLite3::SQLite3)
-        elseif(TARGET SQLite::SQLite3)
-            target_link_libraries(vox PRIVATE SQLite::SQLite3)
-        else()
-            # 回退变量
-            if(SQLite3_INCLUDE_DIRS)
-                target_include_directories(vox PRIVATE ${SQLite3_INCLUDE_DIRS})
-            endif()
-            if(SQLite3_LIBRARIES)
-                target_link_libraries(vox PRIVATE ${SQLite3_LIBRARIES})
-            endif()
-        endif()
-    else()
-        # 回退手动查找
-        find_path(SQLITE3_INCLUDE_DIR sqlite3.h)
-        find_library(SQLITE3_LIBRARY NAMES sqlite3)
-        if(SQLITE3_INCLUDE_DIR AND SQLITE3_LIBRARY)
-            target_sources(vox PRIVATE db/vox_db_sqlite3.c)
-            target_compile_definitions(vox PRIVATE VOX_USE_SQLITE3=1)
-            target_include_directories(vox PRIVATE ${SQLITE3_INCLUDE_DIR})
-            target_link_libraries(vox PRIVATE ${SQLITE3_LIBRARY})
-        else()
-            message(FATAL_ERROR "SQLite3 not found. Disable VOX_USE_SQLITE3 or provide sqlite3 via system/vcpkg and CMAKE_PREFIX_PATH.")
-        endif()
-    endif()
-endif()
+# 供子目录 CMakeLists 使用的目标名
+set(VOX_LIB_TARGET vox)
 
-if(VOX_USE_DUCKDB)
-    find_path(DUCKDB_INCLUDE_DIR duckdb.h)
-    find_library(DUCKDB_LIBRARY NAMES duckdb duckdb_static)
-    #find_library(DUCKDB_LIBRARY NAMES duckdb_static)
-    if(DUCKDB_INCLUDE_DIR AND DUCKDB_LIBRARY)
-        target_sources(vox PRIVATE db/vox_db_duckdb.c)
-        target_compile_definitions(vox PRIVATE VOX_USE_DUCKDB=1)
-        target_include_directories(vox PRIVATE ${DUCKDB_INCLUDE_DIR})
-        target_link_libraries(vox PRIVATE ${DUCKDB_LIBRARY})
-        message(STATUS "Found DuckDB: ${DUCKDB_LIBRARY}")
-    else()
-        message(FATAL_ERROR "DuckDB not found. Disable VOX_USE_DUCKDB or provide duckdb (duckdb.h + library) via system/vcpkg and CMAKE_PREFIX_PATH.")
-    endif()
+# ===== 按模块开关添加子目录（各模块在自己的 CMakeLists.txt 中向 vox 添加源）=====
+if(VOX_USE_COROUTINE)
+    add_subdirectory(coroutine)
 endif()
-
-if(VOX_USE_PGSQL)
-    find_package(PostgreSQL QUIET)
-    if(PostgreSQL_FOUND)
-        target_sources(vox PRIVATE db/vox_db_pgsql.c)
-        target_compile_definitions(vox PRIVATE VOX_USE_PGSQL=1)
-        if(PostgreSQL_INCLUDE_DIRS)
-            target_include_directories(vox PRIVATE ${PostgreSQL_INCLUDE_DIRS})
-        endif()
-        if(PostgreSQL_LIBRARIES)
-            target_link_libraries(vox PRIVATE ${PostgreSQL_LIBRARIES})
-        endif()
-    else()
-        find_path(PGSQL_INCLUDE_DIR libpq-fe.h)
-        find_library(PGSQL_LIBRARY NAMES pq libpq)
-        if(PGSQL_INCLUDE_DIR AND PGSQL_LIBRARY)
-            target_sources(vox PRIVATE db/vox_db_pgsql.c)
-            target_compile_definitions(vox PRIVATE VOX_USE_PGSQL=1)
-            target_include_directories(vox PRIVATE ${PGSQL_INCLUDE_DIR})
-            target_link_libraries(vox PRIVATE ${PGSQL_LIBRARY})
-        else()
-            message(FATAL_ERROR "PostgreSQL (libpq) not found. Disable VOX_USE_PGSQL or provide libpq via system/vcpkg and CMAKE_PREFIX_PATH.")
-        endif()
-    endif()
+if(VOX_USE_SSL)
+    add_subdirectory(ssl)
 endif()
-
-if(VOX_USE_MYSQL)
-    find_package(MySQL QUIET)
-    if(MySQL_FOUND)
-        target_sources(vox PRIVATE db/vox_db_mysql.c)
-        target_compile_definitions(vox PRIVATE VOX_USE_MYSQL=1)
-        if(MySQL_INCLUDE_DIRS)
-            target_include_directories(vox PRIVATE ${MySQL_INCLUDE_DIRS})
-        endif()
-        if(MySQL_LIBRARIES)
-            target_link_libraries(vox PRIVATE ${MySQL_LIBRARIES})
-        endif()
-        message(STATUS "Found MySQL via find_package")
-    else()
-        find_path(MYSQL_INCLUDE_DIR mysql.h
-            PATHS
-            /usr/include/mysql
-            /usr/local/include/mysql
-        )
-        find_library(MYSQL_LIBRARY NAMES mysqlclient libmysql mysql
-            PATHS
-            /usr/lib    
-            /usr/local/lib
-        )
-        if(MYSQL_INCLUDE_DIR AND MYSQL_LIBRARY)
-            target_sources(vox PRIVATE db/vox_db_mysql.c)
-            target_compile_definitions(vox PRIVATE VOX_USE_MYSQL=1)
-            target_include_directories(vox PRIVATE ${MYSQL_INCLUDE_DIR})
-            target_link_libraries(vox PRIVATE ${MYSQL_LIBRARY})
-        else()
-            message(FATAL_ERROR "MySQL client library not found. Disable VOX_USE_MYSQL or provide libmysqlclient/mysql.h via system/vcpkg and CMAKE_PREFIX_PATH.")
-        endif()
-    endif()
+if(VOX_USE_HTTP)
+    add_subdirectory(http)
+endif()
+if(VOX_USE_WEBSOCKET)
+    add_subdirectory(websocket)
+endif()
+if(VOX_USE_REDIS)
+    add_subdirectory(redis)
+endif()
+if(VOX_USE_DB)
+    add_subdirectory(db)
 endif()
 
 # ===== 编译器优化（针对库） =====
@@ -430,8 +260,8 @@ if(VOX_USE_IOURING AND UNIX AND NOT APPLE)
     endif()
 endif()
 
-# ===== SSL 库支持 =====
-if(VOX_USE_OPENSSL)
+# ===== SSL 库支持（仅当启用 SSL 模块时查找/链接）=====
+if(VOX_USE_SSL AND VOX_USE_OPENSSL)
     # 在 Windows 上，优先使用 vcpkg 查找 OpenSSL
     if(WIN32)
         # 检查是否使用了 vcpkg 工具链
@@ -565,8 +395,8 @@ elseif(VOX_USE_MBEDTLS)
     set(VOX_USE_MBEDTLS OFF)
 endif()
 
-# ===== zlib 支持（用于 gzip 压缩）=====
-if(VOX_USE_ZLIB)
+# ===== zlib 支持（用于 HTTP gzip，仅当启用 HTTP 模块时可选）=====
+if(VOX_USE_HTTP AND VOX_USE_ZLIB)
     find_package(ZLIB QUIET)
     if(ZLIB_FOUND)
         message(STATUS "Found zlib:")
@@ -654,10 +484,14 @@ if(VOX_BUILD_TESTS)
         tests/test_process.c
         tests/test_tpool.c
         tests/test_regex.c
-        tests/test_http_router.c
-        tests/test_http_middleware.c
-        tests/test_http_ws.c
     )
+    if(VOX_USE_HTTP)
+        list(APPEND TEST_SOURCES
+            tests/test_http_router.c
+            tests/test_http_middleware.c
+            tests/test_http_ws.c
+        )
+    endif()
 
     # DB 测试：按启用驱动追加
     if(VOX_USE_SQLITE3)
@@ -752,29 +586,30 @@ if(VOX_BUILD_EXAMPLES)
     add_vox_example(loop_queue_work_example)
     add_vox_example(fs_example)
     add_vox_example(dns_example)
-    add_vox_example(http_parser_example)
-    add_vox_example(multipart_parser_example)
-    add_vox_example(http_server_example)
-    add_vox_example(http_middleware_example)
-    add_vox_example(http_client_example)
-    add_vox_example(ws_echo_example)
-    
-    # WebSocket 独立示例
-    add_vox_example(websocket_echo_server)
-    add_vox_example(websocket_echo_client)
-    
-    add_vox_example(redis_client_example)
-    add_vox_example(redis_pool_dynamic_example)
-    add_vox_example(redis_pool_comparison)
+    if(VOX_USE_HTTP)
+        add_vox_example(http_parser_example)
+        add_vox_example(multipart_parser_example)
+        add_vox_example(http_server_example)
+        add_vox_example(http_middleware_example)
+        add_vox_example(http_client_example)
+        add_vox_example(ws_echo_example)
+    endif()
+    if(VOX_USE_WEBSOCKET)
+        add_vox_example(websocket_echo_server)
+        add_vox_example(websocket_echo_client)
+    endif()
+    if(VOX_USE_REDIS)
+        add_vox_example(redis_client_example)
+        add_vox_example(redis_pool_dynamic_example)
+        add_vox_example(redis_pool_comparison)
+    endif()
+    if(VOX_USE_COROUTINE)
+        add_vox_example(coroutine_pool_example)
+        add_vox_example(coroutine_clients_example)
+    endif()
 
-    # 协程池示例（不需要数据库支持）
-    add_vox_example(coroutine_pool_example)
-    
-    # 协程客户端示例
-    add_vox_example(coroutine_clients_example)
-
-    # DB 示例（当至少启用一个 DB 后端时才构建）
-    if(VOX_USE_SQLITE3 OR VOX_USE_DUCKDB OR VOX_USE_PGSQL OR VOX_USE_MYSQL)
+    # DB 示例（当启用 DB 模块且至少启用一个 DB 后端时才构建）
+    if(VOX_USE_DB AND (VOX_USE_SQLITE3 OR VOX_USE_DUCKDB OR VOX_USE_PGSQL OR VOX_USE_MYSQL))
         add_vox_example(db_orm_example)
         add_vox_example(db_example)
         add_vox_example(db_async_worker_example)
@@ -805,8 +640,8 @@ if(VOX_BUILD_EXAMPLES)
     add_vox_example(tcp_echo_test)
     add_vox_example(udp_echo_test)
     
-    # TLS echo 测试（需要 OpenSSL）
-    if(VOX_USE_OPENSSL AND OpenSSL_FOUND)
+    # TLS echo 测试（需要 SSL 模块与 OpenSSL）
+    if(VOX_USE_SSL AND VOX_USE_OPENSSL AND OpenSSL_FOUND)
         add_vox_example(https_server_example)
         add_vox_example(tls_echo_test)
         add_vox_example(dtls_echo_test)
@@ -822,6 +657,7 @@ message(STATUS "  C Compiler:       ${CMAKE_C_COMPILER_ID}")
 message(STATUS "  Build tests:      ${VOX_BUILD_TESTS}")
 message(STATUS "  Build examples:   ${VOX_BUILD_EXAMPLES}")
 message(STATUS "  Build shared:     ${VOX_BUILD_SHARED}")
+message(STATUS "  Modules: coroutine=${VOX_USE_COROUTINE} ssl=${VOX_USE_SSL} http=${VOX_USE_HTTP} websocket=${VOX_USE_WEBSOCKET} redis=${VOX_USE_REDIS} db=${VOX_USE_DB}")
 if(UNIX AND NOT APPLE)
     message(STATUS "  Use io_uring:     ${VOX_USE_IOURING}")
 endif()

@@ -13,6 +13,7 @@
 #include "../vox_string.h"
 #include "vox_http_parser.h"
 #include "vox_http_middleware.h"
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -66,6 +67,10 @@ struct vox_http_response {
 void vox_http_context_next(vox_http_context_t* ctx);
 void vox_http_context_abort(vox_http_context_t* ctx);
 bool vox_http_context_is_aborted(const vox_http_context_t* ctx);
+/** 当前 handler 链下标（defer 前保存，用于异步回调后恢复执行） */
+size_t vox_http_context_get_index(const vox_http_context_t* ctx);
+/** 恢复执行链：置 aborted=false 并设 index，之后可调用 next() 继续执行后续 handler */
+void vox_http_context_resume_at(vox_http_context_t* ctx, size_t at_index);
 
 /* ===== async/defer response ===== */
 /**

@@ -276,6 +276,9 @@ extern "C" {
 /* 向上对齐到对齐边界 */
 #define VOX_ALIGN_SIZE(size, align) (((size) + (align) - 1) & ~((align) - 1))
 
+/* 计算数组大小 */
+#define VOX_ARRAY_SIZE(array) (sizeof(array) / sizeof(array[0]))
+
 /* ===== 平台特定头文件 ===== */
 
 #ifdef VOX_OS_WINDOWS

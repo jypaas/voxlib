@@ -52,6 +52,7 @@ static void on_body(vox_http_client_req_t* req, const void* data, size_t len, vo
     (void)user_data;
     if (data && len) {
         fwrite(data, 1, len, stdout);
+        fprintf(stdout, "\n");
     }
 }
 

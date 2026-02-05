@@ -48,6 +48,16 @@ bool vox_http_context_is_aborted(const vox_http_context_t* ctx) {
     return ctx ? ctx->aborted : true;
 }
 
+size_t vox_http_context_get_index(const vox_http_context_t* ctx) {
+    return ctx ? ctx->index : 0;
+}
+
+void vox_http_context_resume_at(vox_http_context_t* ctx, size_t at_index) {
+    if (!ctx) return;
+    ctx->aborted = false;
+    ctx->index = at_index;
+}
+
 void vox_http_context_defer(vox_http_context_t* ctx) {
     if (!ctx) return;
     if (!ctx->deferred) {
@@ -275,28 +285,30 @@ int vox_http_context_build_response(const vox_http_context_t* ctx, vox_string_t*
             body_len = ctx->sendfile_count;
 
 #ifdef VOX_USE_ZLIB
-        /* 检查是否应该使用 gzip 压缩 */
-        if (body_len > 0 && !vox_http_has_header((const vox_vector_t*)ctx->res.headers, "Content-Encoding")) {
-            /* 检查客户端是否支持 gzip */
-            if (vox_http_supports_gzip(ctx->req.headers)) {
-                /* 只压缩较大的响应体（通常 > 256 字节才有意义） */
-                if (body_len >= 1024) {
-                    compressed_body = vox_string_create(ctx->mpool);
-                    if (compressed_body) {
-                        int compress_result = vox_http_gzip_compress(ctx->mpool, 
-                                                    vox_string_data(ctx->res.body), 
-                                                    body_len, 
-                                                    compressed_body);
-                        if (compress_result == 0) {
-                            size_t compressed_len = vox_string_length(compressed_body);
-                            /* 只有当压缩后确实更小才使用 */
-                            if (compressed_len < body_len) {
-                                use_gzip = true;
-                                body_len = compressed_len;
+        /* 仅当响应体在 res.body 中时才压缩（sendfile 时内容不在内存，无法压缩） */
+        if (body_len > 0 && !(ctx->sendfile_file && ctx->sendfile_count > 0) &&
+            ctx->res.body && !vox_http_has_header((const vox_vector_t*)ctx->res.headers, "Content-Encoding")) {
+            size_t actual_len = vox_string_length(ctx->res.body);
+            if (actual_len == body_len) {
+                /* 检查客户端是否支持 gzip */
+                if (vox_http_supports_gzip(ctx->req.headers)) {
+                    /* 只压缩较大的响应体（通常 > 256 字节才有意义） */
+                    if (body_len >= 1024) {
+                        compressed_body = vox_string_create(ctx->mpool);
+                        if (compressed_body) {
+                            int compress_result = vox_http_gzip_compress(ctx->mpool,
+                                                                        vox_string_data(ctx->res.body),
+                                                                        body_len,
+                                                                        compressed_body);
+                            if (compress_result == 0) {
+                                size_t compressed_len = vox_string_length(compressed_body);
+                                /* 只有当压缩后确实更小才使用 */
+                                if (compressed_len < body_len) {
+                                    use_gzip = true;
+                                    body_len = compressed_len;
+                                }
                             }
                         }
-                        /* 注意：compressed_body 由 mpool 管理，不需要手动释放
-                         * 如果不使用压缩，compressed_body 会在 mpool 清理时自动回收 */
                     }
                 }
             }
