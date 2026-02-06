@@ -346,6 +346,21 @@ static int ws_handle_handshake(vox_ws_connection_t* conn, const char* data, size
         return 0;
     }
     
+    /* 可选：校验请求路径 */
+    if (conn->server->config.path && conn->server->config.path[0] != '\0') {
+        const char* req = buf;
+        if (buf_len < 5 || strncmp(req, "GET ", 4) != 0) return -1;
+        req += 4;
+        const char* path_start = req;
+        while (req < end_marker && *req != ' ' && *req != '?' && *req != '\r') req++;
+        size_t path_len = (size_t)(req - path_start);
+        const char* expect = conn->server->config.path;
+        size_t expect_len = strlen(expect);
+        if (path_len != expect_len || (path_len > 0 && strncmp(path_start, expect, path_len) != 0)) {
+            return -1;
+        }
+    }
+
     /* 解析握手 */
     const char* key = ws_get_header(conn->mpool, buf, buf_len, "Sec-WebSocket-Key");
     const char* version = ws_get_header(conn->mpool, buf, buf_len, "Sec-WebSocket-Version");

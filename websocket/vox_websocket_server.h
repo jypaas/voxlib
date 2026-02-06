@@ -40,6 +40,7 @@ typedef struct {
     void* user_data;                     /* 用户数据 */
     size_t max_message_size;             /* 最大消息大小（0表示无限制） */
     bool enable_compression;             /* 是否启用压缩（未实现） */
+    const char* path;                    /* 可选：仅接受此 HTTP 路径的升级（如 "/mqtt"），NULL 表示接受任意路径 */
 } vox_ws_server_config_t;
 
 /**
