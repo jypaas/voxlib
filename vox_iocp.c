@@ -116,6 +116,8 @@ vox_iocp_t* vox_iocp_create(const vox_iocp_config_t* config) {
         }
         return NULL;
     }
+
+    VOX_LOG_INFO("iocp backend created");
     
     return iocp;
 }

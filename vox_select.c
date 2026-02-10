@@ -184,7 +184,9 @@ vox_select_t* vox_select_create(const vox_select_config_t* config) {
         }
         return NULL;
     }
-    
+
+    VOX_LOG_INFO("select backend created");
+
     return select;
 }
 

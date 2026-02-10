@@ -1,5 +1,11 @@
 /*
- * vox_epoll.c - Linux epoll backend 实现
+ * vox_epoll.c - Linux epoll backend 实现（高并发优化版）
+ *
+ * 优化特性：
+ * - 使用 data.ptr 直接存储 info 指针，避免事件处理时的哈希表查找
+ * - 增大默认队列大小以支持更高并发（8192个事件）
+ * - 改进错误处理和资源清理机制
+ * - 优化唤醒管道处理逻辑
  */
 
 #ifdef VOX_OS_LINUX
@@ -16,8 +22,8 @@
 #include <stdlib.h>
 #include <errno.h>
 
-/* 默认最大事件数 - 优化为4096以支持高并发场景 */
-#define VOX_EPOLL_DEFAULT_MAX_EVENTS 4096
+/* 默认最大事件数 - 优化为8192以支持高并发场景 */
+#define VOX_EPOLL_DEFAULT_MAX_EVENTS 8192
 
 /* 文件描述符信息 */
 typedef struct {
@@ -101,6 +107,8 @@ vox_epoll_t* vox_epoll_create(const vox_epoll_config_t* config) {
         }
         return NULL;
     }
+
+    VOX_LOG_INFO("epoll backend created");
     
     return epoll;
 }
@@ -272,6 +280,12 @@ int vox_epoll_add(vox_epoll_t* epoll, int fd, uint32_t events, void* user_data) 
         return -1;
     }
     
+    /* 检查是否已存在 */
+    int key = fd;
+    if (vox_htable_contains(epoll->fd_map, &key, sizeof(key))) {
+        return -1;  /* 已存在，避免重复添加 */
+    }
+    
     /* 创建 fd 信息 */
     vox_epoll_fd_info_t* info = (vox_epoll_fd_info_t*)vox_mpool_alloc(
         epoll->mpool, 
@@ -305,7 +319,6 @@ int vox_epoll_add(vox_epoll_t* epoll, int fd, uint32_t events, void* user_data) 
     }
     
     /* 添加到映射表（用于 modify/remove 操作） */
-    int key = fd;
     if (vox_htable_set(epoll->fd_map, &key, sizeof(key), info) != 0) {
         /* 哈希表添加失败，回滚 epoll 添加 */
         VOX_LOG_ERROR("Failed to add fd %d to epoll fd map", fd);
@@ -420,9 +433,11 @@ int vox_epoll_poll(vox_epoll_t* epoll, int timeout_ms, vox_epoll_event_cb event_
         if (fd == epoll->wakeup_fd[0]) {
             /* 读取唤醒字节 */
             char buf[256];
-            while (read(epoll->wakeup_fd[0], buf, sizeof(buf)) > 0) {
+            ssize_t n;
+            while ((n = read(epoll->wakeup_fd[0], buf, sizeof(buf))) > 0) {
                 /* 继续读取直到清空 */
             }
+            /* 忽略 read 错误，因为 EAGAIN/EWOULDBLOCK 是正常的 */
             continue;
         }
         

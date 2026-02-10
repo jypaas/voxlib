@@ -102,6 +102,8 @@ vox_kqueue_t* vox_kqueue_create(const vox_kqueue_config_t* config) {
         }
         return NULL;
     }
+
+    VOX_LOG_INFO("kqueue backend created");
     
     return kq;
 }

@@ -1,10 +1,13 @@
 /*
- * vox_uring.c - Linux io_uring backend 实现（高性能优化版）
+ * vox_uring.c - Linux io_uring backend 实现（高并发优化版）
  *
  * 优化特性：
  * - 使用 multishot poll 避免每次事件后重新注册
  * - 批量提交 SQE 减少系统调用
  * - 使用 io_uring_submit_and_wait 合并提交和等待
+ * - 移除 SINGLE_ISSUER 限制以支持多线程并发提交
+ * - 增大默认队列大小以支持更高并发
+ * - 实现队列满时的自动提交重试机制
  */
 
 #ifdef VOX_OS_LINUX
@@ -23,9 +26,9 @@
 #include <stdlib.h>
 #include <errno.h>
 
-/* 默认配置 */
-#define VOX_URING_DEFAULT_MAX_EVENTS 4096
-#define VOX_URING_DEFAULT_SQ_ENTRIES 4096
+/* 默认配置 - 针对高并发优化 */
+#define VOX_URING_DEFAULT_MAX_EVENTS 8192
+#define VOX_URING_DEFAULT_SQ_ENTRIES 8192
 
 /* Multishot poll 标志（Linux 5.13+） */
 #ifndef IORING_POLL_ADD_MULTI
@@ -53,12 +56,23 @@ struct vox_uring {
     bool use_multishot;                /* 是否支持 multishot poll */
 };
 
-/* 注册 poll 操作（支持 multishot） */
+/* 注册 poll 操作（支持 multishot）- 增强版，处理队列满情况 */
 static int uring_add_poll(vox_uring_t* uring, vox_uring_fd_info_t* info) {
     struct io_uring_sqe* sqe = io_uring_get_sqe(&uring->ring);
     if (!sqe) {
-        VOX_LOG_ERROR("Failed to get SQE from io_uring ring");
-        return -1;
+        /* 提交队列满，先提交现有请求再重试 */
+        int submit_ret = io_uring_submit(&uring->ring);
+        if (submit_ret < 0) {
+            VOX_LOG_ERROR("Failed to submit io_uring requests: ret=%d", submit_ret);
+            return -1;
+        }
+        
+        /* 重试获取 SQE */
+        sqe = io_uring_get_sqe(&uring->ring);
+        if (!sqe) {
+            VOX_LOG_ERROR("Failed to get SQE from io_uring ring even after submit");
+            return -1;
+        }
     }
 
     uint32_t poll_mask = 0;
@@ -123,6 +137,8 @@ vox_uring_t* vox_uring_create(const vox_uring_config_t* config) {
         return NULL;
     }
 
+    VOX_LOG_INFO("io_uring backend created");
+
     return uring;
 }
 
@@ -133,19 +149,30 @@ int vox_uring_init(vox_uring_t* uring) {
         return -1;
     }
 
-    /* 初始化 io_uring，使用 COOP_TASKRUN 减少内核开销 */
+    /* 初始化 io_uring，避免 SINGLE_ISSUER 限制并发 */
     struct io_uring_params params;
     memset(&params, 0, sizeof(params));
 
+    /* 启用多线程支持和性能优化标志 */
+    
     /* COOP_TASKRUN: 减少内核中断，提高性能（Linux 5.19+） */
 #ifdef IORING_SETUP_COOP_TASKRUN
     params.flags |= IORING_SETUP_COOP_TASKRUN;
 #endif
 
-    /* SINGLE_ISSUER: 单线程优化（Linux 6.0+） */
-#ifdef IORING_SETUP_SINGLE_ISSUER
-    params.flags |= IORING_SETUP_SINGLE_ISSUER;
+    /* DEFER_TASKRUN: 进一步减少内核抢占，提高性能（Linux 5.19+） */
+#ifdef IORING_SETUP_DEFER_TASKRUN
+    params.flags |= IORING_SETUP_DEFER_TASKRUN;
 #endif
+
+    /* 移除 SINGLE_ISSUER 以允许多线程提交（Linux 6.0+） */
+    /* 原因：SINGLE_ISSUER 限制仅单线程可提交请求，严重影响高并发性能 */
+#ifdef IORING_SETUP_SINGLE_ISSUER
+    /* 不设置 IORING_SETUP_SINGLE_ISSUER 以允许多线程提交 */
+#endif
+
+    /* SQPOLL: 内核线程轮询模式（需要特权，可根据需要启用） */
+    /* params.flags |= IORING_SETUP_SQPOLL; */
 
     int ret = io_uring_queue_init_params(VOX_URING_DEFAULT_SQ_ENTRIES, &uring->ring, &params);
     if (ret < 0) {
@@ -286,7 +313,9 @@ int vox_uring_add(vox_uring_t* uring, int fd, uint32_t events, void* user_data) 
         return -1;
     }
 
-    /* 不立即提交，让 poll 批量提交 */
+    /* 立即提交 SQE，避免队列满 */
+    io_uring_submit(&uring->ring);
+    
     return 0;
 }
 
@@ -323,6 +352,9 @@ int vox_uring_modify(vox_uring_t* uring, int fd, uint32_t events) {
     if (uring_add_poll(uring, info) != 0) {
         return -1;
     }
+    
+    /* 立即提交 SQE */
+    io_uring_submit(&uring->ring);
 
     return 0;
 }
@@ -348,6 +380,9 @@ int vox_uring_remove(vox_uring_t* uring, int fd) {
         vox_htable_delete(uring->fd_map, &key, sizeof(key));
         vox_mpool_free(uring->mpool, info);
     }
+    
+    /* 提交移除操作的 SQE */
+    io_uring_submit(&uring->ring);
 
     return 0;
 }
@@ -367,7 +402,7 @@ int vox_uring_poll(vox_uring_t* uring, int timeout_ms, vox_uring_event_cb event_
     if (!uring || !uring->initialized || !event_cb) {
         return -1;
     }
-
+    
     /* 使用 submit_and_wait 合并提交和等待 */
     struct __kernel_timespec ts;
     struct __kernel_timespec* ts_ptr = NULL;
@@ -433,7 +468,9 @@ int vox_uring_poll(vox_uring_t* uring, int timeout_ms, vox_uring_event_cb event_
         } else if (fd == uring->wakeup_fd[0]) {
             /* 唤醒事件：清空管道 */
             char buf[256];
-            while (read(uring->wakeup_fd[0], buf, sizeof(buf)) > 0);
+            ssize_t n;
+            while ((n = read(uring->wakeup_fd[0], buf, sizeof(buf))) > 0);
+            /* 忽略 read 错误，因为 EAGAIN/EWOULDBLOCK 是正常的 */
 
             /* 如果不是 multishot 或 multishot 结束，重新注册 */
             if (!more) {
@@ -463,6 +500,9 @@ int vox_uring_poll(vox_uring_t* uring, int timeout_ms, vox_uring_event_cb event_
 
     /* 批量标记 CQE 已处理 */
     io_uring_cq_advance(&uring->ring, cqe_count);
+    
+    /* 及时提交新添加的 SQE，避免队列满 */
+    io_uring_submit(&uring->ring);
 
     return processed;
 }

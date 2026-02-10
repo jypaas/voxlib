@@ -46,7 +46,17 @@ int main(void) {
 
     vox_log_set_level(VOX_LOG_INFO);
 
-    vox_loop_t* loop = vox_loop_create();
+    /* 配置 backend */
+    vox_backend_config_t backend_config = {0};
+    backend_config.type = VOX_BACKEND_TYPE_AUTO;
+    backend_config.mpool = NULL;  /* 使用 loop 内部创建的内存池 */
+    backend_config.max_events = 1024 * 100;  /* 使用默认值 */
+    
+    /* 配置 loop */
+    vox_loop_config_t loop_config = {0};
+    loop_config.backend_config = &backend_config;
+
+    vox_loop_t* loop = vox_loop_create_with_config(&loop_config);
     if (!loop) {
         fprintf(stderr, "vox_loop_create failed\n");
         return 1;
