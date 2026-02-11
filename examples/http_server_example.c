@@ -18,7 +18,7 @@
 static void mw_logger(vox_http_context_t* ctx) {
     const vox_http_request_t* req = vox_http_context_request(ctx);
     if (req && req->path.ptr) {
-        VOX_LOG_INFO("[http] %.*s", (int)req->path.len, req->path.ptr);
+        VOX_LOG_DEBUG("[http] %.*s", (int)req->path.len, req->path.ptr);
     }
     vox_http_context_next(ctx);
 }
@@ -97,7 +97,9 @@ int main(void) {
         return 1;
     }
 
-    if (vox_http_server_listen_tcp(server, &addr, 128) != 0) {
+    /* 使用更大的 backlog 以支持高并发连接（如 wrk -c1000）
+     * Windows 的 listen backlog 会被限制在 SOMAXCONN_HINT(65535) 或更小 */
+    if (vox_http_server_listen_tcp(server, &addr, 2048) != 0) {
         fprintf(stderr, "listen tcp failed\n");
         return 1;
     }

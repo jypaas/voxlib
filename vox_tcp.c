@@ -143,25 +143,42 @@ void vox_tcp_backend_event_cb(vox_backend_t* backend, int fd, uint32_t events, v
         switch (ov_ex->io_type) {
             case VOX_TCP_IO_ACCEPT:
                 /* AcceptEx 完成 */
-                tcp->accept_pending = false;
+                /* 从 OVERLAPPED 指针获取 accept 上下文 */
+                {
+                    vox_tcp_accept_ctx_t* ctx = vox_container_of(ov_ex, vox_tcp_accept_ctx_t, ov_ex);
 
-                /* 更新接受上下文 */
-                if (tcp->accept_socket != INVALID_SOCKET) {
-                    SOCKET listen_sock = (SOCKET)tcp->socket.fd;
-                    if (setsockopt(tcp->accept_socket, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
-                                  (char*)&listen_sock, sizeof(listen_sock)) == SOCKET_ERROR) {
-                        DWORD error = WSAGetLastError();
-                        VOX_LOG_ERROR("SO_UPDATE_ACCEPT_CONTEXT failed, error=%lu", error);
+                    /* 更新接受上下文 */
+                    if (ctx->socket != INVALID_SOCKET) {
+                        SOCKET listen_sock = (SOCKET)tcp->socket.fd;
+                        if (setsockopt(ctx->socket, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
+                                      (char*)&listen_sock, sizeof(listen_sock)) == SOCKET_ERROR) {
+                            DWORD error = WSAGetLastError();
+                            VOX_LOG_ERROR("SO_UPDATE_ACCEPT_CONTEXT failed, error=%lu", error);
+                        }
                     }
-                }
 
-                /* 调用连接回调 */
-                if (tcp->connection_cb) {
-                    tcp->connection_cb(tcp, 0, vox_handle_get_data((vox_handle_t*)tcp));
-                }
+                    /* 将 accepted socket 保存到临时字段，供 vox_tcp_accept 使用 */
+                    tcp->accept_socket = ctx->socket;
 
-                /* 启动下一个 AcceptEx */
-                tcp_start_accept_async(tcp);
+                    /* 清除上下文状态 */
+                    ctx->socket = INVALID_SOCKET;
+                    ctx->pending = false;
+                    tcp->accept_pending_count--;
+
+                    /* 调用连接回调 */
+                    if (tcp->connection_cb) {
+                        tcp->connection_cb(tcp, 0, vox_handle_get_data((vox_handle_t*)tcp));
+                    } else {
+                        /* 如果没有回调，关闭 socket */
+                        if (tcp->accept_socket != INVALID_SOCKET) {
+                            closesocket(tcp->accept_socket);
+                            tcp->accept_socket = INVALID_SOCKET;
+                        }
+                    }
+
+                    /* 立即发起新的 AcceptEx 操作以维护操作池 */
+                    tcp_start_accept_async(tcp);
+                }
                 return;
 
             case VOX_TCP_IO_RECV:
@@ -180,8 +197,13 @@ void vox_tcp_backend_event_cb(vox_backend_t* backend, int fd, uint32_t events, v
                                      vox_handle_get_data((vox_handle_t*)tcp));
 
                         /* 如果还在读取，启动下一个 WSARecv */
-                        if (tcp->reading) {
-                            tcp_start_recv_async(tcp);
+                        /* 添加连接状态检查，避免对已关闭的连接进行读取 */
+                        if (tcp->reading && tcp->socket.fd != VOX_INVALID_SOCKET && tcp->connected) {
+                            if (tcp_start_recv_async(tcp) != 0) {
+                                /* WSARecv 失败（通常是连接被远端关闭），触发连接关闭 */
+                                tcp->read_cb(tcp, 0, NULL, vox_handle_get_data((vox_handle_t*)tcp));
+                                vox_tcp_read_stop(tcp);
+                            }
                         }
                     } else {
                         /* 连接关闭 */
@@ -196,7 +218,14 @@ void vox_tcp_backend_event_cb(vox_backend_t* backend, int fd, uint32_t events, v
                     if (tcp->reading && bytes_transferred > 0) {
                         /* 继续启动下一个 WSARecv，以便继续读取数据
                          * TLS 的 backend 事件回调会处理这些数据 */
-                        tcp_start_recv_async(tcp);
+                        /* 添加连接状态检查，避免对已关闭的连接进行读取 */
+                        if (tcp->socket.fd != VOX_INVALID_SOCKET && tcp->connected) {
+                            if (tcp_start_recv_async(tcp) != 0) {
+                                /* WSARecv 失败（通常是连接被远端关闭），停止读取 */
+                                /* 对于 TLS 模式，backend 事件回调会处理连接关闭 */
+                                vox_tcp_read_stop(tcp);
+                            }
+                        }
                     } else if (bytes_transferred == 0) {
                         /* 连接关闭，通知 TLS（通过 completion key 的 user_data） */
                         /* 事件应该已经通过 handle_backend_event 路由到 TLS 的回调了 */
@@ -232,9 +261,25 @@ void vox_tcp_backend_event_cb(vox_backend_t* backend, int fd, uint32_t events, v
                         tcp_process_write_queue(tcp);
                     } else {
                         /* 继续发送剩余数据 */
-                        tcp_start_send_async(tcp,
-                                            (const char*)req->buf + req->offset,
-                                            req->len - req->offset);
+                        if (tcp_start_send_async(tcp,
+                                                (const char*)req->buf + req->offset,
+                                                req->len - req->offset) != 0) {
+                            /* WSASend 失败，通知写入错误 */
+                            vox_tcp_write_cb cb = req->cb;
+                            vox_mpool_t* mpool = vox_loop_get_mpool(tcp->handle.loop);
+                            vox_tcp_write_req_t* next = req->next;
+
+                            tcp->write_queue = next;
+
+                            if (cb) {
+                                cb(tcp, -1, vox_handle_get_data((vox_handle_t*)tcp));
+                            }
+
+                            vox_mpool_free(mpool, req);
+
+                            /* 继续处理队列中的下一个请求 */
+                            tcp_process_write_queue(tcp);
+                        }
                     }
                 }
                 return;
@@ -620,39 +665,99 @@ static void tcp_process_write_queue(vox_tcp_t* tcp) {
     if (!tcp || !tcp->write_queue) {
         return;
     }
-    
+
     vox_mpool_t* mpool = vox_loop_get_mpool(tcp->handle.loop);
+
+#ifdef VOX_OS_WINDOWS
+    /* Windows IOCP: 检查是否使用 IOCP backend，如果是则使用异步 WSASend */
+    vox_backend_t* backend = vox_loop_get_backend(tcp->handle.loop);
+    if (backend && vox_backend_get_type(backend) == VOX_BACKEND_TYPE_IOCP) {
+        /* IOCP 模式：一次只处理队列头的一个请求（使用异步 WSASend） */
+        vox_tcp_write_req_t* req = (vox_tcp_write_req_t*)tcp->write_queue;
+
+        /* 计算剩余需要写入的数据 */
+        const void* buf = (const char*)req->buf + req->offset;
+        size_t remaining = req->len - req->offset;
+
+        if (remaining == 0) {
+            /* 当前请求已完成（这不应该发生，但防御性处理） */
+            vox_tcp_write_cb cb = req->cb;
+            vox_tcp_write_req_t* next = req->next;
+
+            tcp->write_queue = (void*)next;
+
+            if (cb) {
+                cb(tcp, 0, vox_handle_get_data((vox_handle_t*)tcp));
+            }
+
+            vox_mpool_free(mpool, req);
+
+            /* 递归处理下一个请求 */
+            if (next) {
+                tcp_process_write_queue(tcp);
+            }
+            return;
+        }
+
+        /* 如果没有待处理的发送操作，启动异步 WSASend */
+        if (!tcp->send_pending) {
+            if (tcp_start_send_async(tcp, buf, remaining) != 0) {
+                /* WSASend 失败（通常是连接被关闭） */
+                vox_tcp_write_cb cb = req->cb;
+                vox_tcp_write_req_t* next = req->next;
+
+                tcp->write_queue = (void*)next;
+
+                if (cb) {
+                    cb(tcp, -1, vox_handle_get_data((vox_handle_t*)tcp));
+                }
+
+                vox_mpool_free(mpool, req);
+
+                /* 继续处理下一个请求（虽然可能也会失败） */
+                if (next) {
+                    tcp_process_write_queue(tcp);
+                }
+            }
+            /* WSASend 成功提交，等待 IOCP 完成通知 */
+        }
+        /* 如果已有待处理的发送操作，等待其完成后会再次调用本函数 */
+        return;
+    }
+#endif
+
+    /* 非 IOCP 模式：使用同步 send + 可写事件通知 */
     vox_tcp_write_req_t* req = (vox_tcp_write_req_t*)tcp->write_queue;
-    
+
     while (req) {
         /* 计算剩余需要写入的数据 */
         const void* buf = (const char*)req->buf + req->offset;
         size_t remaining = req->len - req->offset;
-        
+
         if (remaining == 0) {
             /* 当前请求已完成 */
             vox_tcp_write_cb cb = req->cb;
             vox_tcp_write_req_t* next = req->next;
-            
+
             /* 从链表中移除当前请求 */
             tcp->write_queue = (void*)next;
-            
+
             /* 调用回调 */
             if (cb) {
                 cb(tcp, 0, vox_handle_get_data((vox_handle_t*)tcp));
             }
-            
+
             /* 释放当前请求 */
             vox_mpool_free(mpool, req);
-            
+
             /* 处理下一个请求 */
             req = next;
             continue;
         }
-        
+
         /* 尝试写入剩余数据 */
         int64_t nwritten = vox_socket_send(&tcp->socket, buf, remaining);
-        
+
         if (nwritten < 0) {
             /* 检查是否是 EAGAIN/EWOULDBLOCK（非阻塞 socket 缓冲区满） */
 #ifdef VOX_OS_WINDOWS
@@ -670,42 +775,42 @@ static void tcp_process_write_queue(vox_tcp_t* tcp) {
             /* 真正的写入错误 */
             vox_tcp_write_cb cb = req->cb;
             vox_tcp_write_req_t* next = req->next;
-            
+
             /* 从链表中移除当前请求 */
             tcp->write_queue = (void*)next;
-            
+
             /* 调用回调（错误） */
             if (cb) {
                 cb(tcp, -1, vox_handle_get_data((vox_handle_t*)tcp));
             }
-            
+
             /* 释放当前请求 */
             vox_mpool_free(mpool, req);
-            
+
             /* 处理下一个请求 */
             req = next;
             continue;
         }
-        
+
         /* 更新偏移量 */
         req->offset += (size_t)nwritten;
-        
+
         if (req->offset >= req->len) {
             /* 当前请求已完成 */
             vox_tcp_write_cb cb = req->cb;
             vox_tcp_write_req_t* next = req->next;
-            
+
             /* 从链表中移除当前请求 */
             tcp->write_queue = (void*)next;
-            
+
             /* 调用回调 */
             if (cb) {
                 cb(tcp, 0, vox_handle_get_data((vox_handle_t*)tcp));
             }
-            
+
             /* 释放当前请求 */
             vox_mpool_free(mpool, req);
-            
+
             /* 处理下一个请求 */
             req = next;
         } else {
@@ -713,7 +818,7 @@ static void tcp_process_write_queue(vox_tcp_t* tcp) {
             break;
         }
     }
-    
+
     /* 如果队列为空，移除可写事件监听，但要小心处理连接完成后的状态 */
     if (!tcp->write_queue) {
         uint32_t new_events = tcp->backend_events & ~VOX_BACKEND_WRITE;
@@ -766,18 +871,15 @@ int vox_tcp_init(vox_tcp_t* tcp, vox_loop_t* loop) {
     tcp->write_ov_ex.io_type = VOX_TCP_IO_SEND;
     tcp->write_ov_ex.tcp = tcp;
 
-    memset(&tcp->accept_ov_ex, 0, sizeof(vox_tcp_overlapped_ex_t));
-    tcp->accept_ov_ex.io_type = VOX_TCP_IO_ACCEPT;
-    tcp->accept_ov_ex.tcp = tcp;
-
     memset(&tcp->connect_ov_ex, 0, sizeof(vox_tcp_overlapped_ex_t));
     tcp->connect_ov_ex.io_type = VOX_TCP_IO_CONNECT;
     tcp->connect_ov_ex.tcp = tcp;
 
-    tcp->accept_buffer = NULL;
-    tcp->accept_buffer_size = 0;
+    /* 初始化 AcceptEx 操作池（在 listen 时分配） */
+    tcp->accept_pool = NULL;
+    tcp->accept_pool_size = 0;
+    tcp->accept_pending_count = 0;
     tcp->accept_socket = INVALID_SOCKET;
-    tcp->accept_pending = false;
 
     tcp->recv_bufs = NULL;
     tcp->recv_buf_count = 0;
@@ -860,8 +962,14 @@ void vox_tcp_destroy(vox_tcp_t* tcp) {
     vox_mpool_t* mpool = vox_loop_get_mpool(tcp->handle.loop);
 
     /* 取消待处理的异步操作 */
-    if (tcp->accept_pending && tcp->socket.fd != VOX_INVALID_SOCKET) {
-        CancelIoEx((HANDLE)(ULONG_PTR)tcp->socket.fd, &tcp->accept_ov_ex.overlapped);
+    /* 取消 AcceptEx 操作池中的所有待处理操作 */
+    if (tcp->accept_pool && tcp->socket.fd != VOX_INVALID_SOCKET) {
+        for (int i = 0; i < tcp->accept_pool_size; i++) {
+            vox_tcp_accept_ctx_t* ctx = &tcp->accept_pool[i];
+            if (ctx->pending) {
+                CancelIoEx((HANDLE)(ULONG_PTR)tcp->socket.fd, &ctx->ov_ex.overlapped);
+            }
+        }
     }
     if (tcp->recv_pending && tcp->socket.fd != VOX_INVALID_SOCKET) {
         CancelIoEx((HANDLE)(ULONG_PTR)tcp->socket.fd, &tcp->read_ov_ex.overlapped);
@@ -873,11 +981,35 @@ void vox_tcp_destroy(vox_tcp_t* tcp) {
         CancelIoEx((HANDLE)(ULONG_PTR)tcp->socket.fd, &tcp->connect_ov_ex.overlapped);
     }
     
-    /* 释放 AcceptEx 缓冲区 */
-    if (tcp->accept_buffer) {
-        vox_mpool_free(mpool, tcp->accept_buffer);
-        tcp->accept_buffer = NULL;
-        tcp->accept_buffer_size = 0;
+    /* 清理 AcceptEx 操作池 */
+    if (tcp->accept_pool) {
+        for (int i = 0; i < tcp->accept_pool_size; i++) {
+            vox_tcp_accept_ctx_t* ctx = &tcp->accept_pool[i];
+
+            /* 关闭待处理的 accept socket */
+            if (ctx->socket != INVALID_SOCKET) {
+                closesocket(ctx->socket);
+                ctx->socket = INVALID_SOCKET;
+            }
+
+            /* 释放缓冲区 */
+            if (ctx->buffer) {
+                vox_mpool_free(mpool, ctx->buffer);
+                ctx->buffer = NULL;
+            }
+        }
+
+        /* 释放操作池数组 */
+        vox_mpool_free(mpool, tcp->accept_pool);
+        tcp->accept_pool = NULL;
+        tcp->accept_pool_size = 0;
+        tcp->accept_pending_count = 0;
+    }
+
+    /* 清理临时 accept socket */
+    if (tcp->accept_socket != INVALID_SOCKET) {
+        closesocket(tcp->accept_socket);
+        tcp->accept_socket = INVALID_SOCKET;
     }
     
     /* 释放 WSARecv 缓冲区 */
@@ -1006,8 +1138,8 @@ int vox_tcp_accept(vox_tcp_t* server, vox_tcp_t* client) {
 #ifdef VOX_OS_WINDOWS
     /* Windows IOCP: 检查是否使用 IOCP backend 和 AcceptEx */
     vox_backend_t* backend = vox_loop_get_backend(server->handle.loop);
-    if (backend && vox_backend_get_type(backend) == VOX_BACKEND_TYPE_IOCP && 
-        server->accept_pending == false && server->accept_socket != INVALID_SOCKET) {
+    if (backend && vox_backend_get_type(backend) == VOX_BACKEND_TYPE_IOCP &&
+        server->accept_socket != INVALID_SOCKET) {
         /* AcceptEx 已经完成，使用预先创建的 socket */
         SOCKET accept_sock = server->accept_socket;
         client->socket.fd = (vox_socket_fd_t)accept_sock;
@@ -1017,11 +1149,8 @@ int vox_tcp_accept(vox_tcp_t* server, vox_tcp_t* client) {
         client->connected = true;
         
         /* 从 AcceptEx 缓冲区提取地址信息（可选） */
-        /* AcceptEx 缓冲区格式：远程地址 + 本地地址 + 可选数据 */
-        if (server->accept_buffer) {
-            /* 可以在这里解析地址信息，但当前实现不需要 */
-        }
-        
+        /* 注意：地址信息已经在 AcceptEx 操作池的缓冲区中，如果需要可以解析 */
+
         /* 清除 accept_socket，准备下一个 AcceptEx */
         server->accept_socket = INVALID_SOCKET;
         
@@ -1062,7 +1191,13 @@ int vox_tcp_accept(vox_tcp_t* server, vox_tcp_t* client) {
          * 
          * 但是，WSAEFAULT 错误通常意味着参数无效，而不是 completion key 问题。
          * 让我们检查一下是否是因为 socket 还没有完全准备好。
+         * 
+         * 修复：添加更详细的错误检查和日志
          */
+        DWORD update_error = WSAGetLastError();
+        if (update_error != 0) {
+            VOX_LOG_WARN("SO_UPDATE_ACCEPT_CONTEXT failed, error=%lu. This may cause WSARecv issues later.", update_error);
+        }
         
         return 0;
     }
@@ -1312,6 +1447,22 @@ int vox_tcp_read_stop(vox_tcp_t* tcp) {
     tcp->read_cb = NULL;
     tcp->alloc_cb = NULL;
     
+#ifdef VOX_OS_WINDOWS
+    /* 在 Windows IOCP 模式下，如果有待处理的 WSARecv 操作，需要取消它 */
+    if (tcp->recv_pending && tcp->socket.fd != VOX_INVALID_SOCKET) {
+        /* 取消待处理的 WSARecv 操作 */
+        if (CancelIoEx((HANDLE)(ULONG_PTR)tcp->socket.fd, &tcp->read_ov_ex.overlapped)) {
+            VOX_LOG_DEBUG("Cancelled pending WSARecv operation for socket %d", (int)tcp->socket.fd);
+        } else {
+            DWORD error = GetLastError();
+            if (error != ERROR_NOT_FOUND) {
+                VOX_LOG_WARN("Failed to cancel WSARecv operation, error=%lu", error);
+            }
+        }
+        tcp->recv_pending = false;
+    }
+#endif
+    
     /* 更新 backend 事件，移除可读事件 */
     uint32_t events = tcp->backend_events & ~VOX_BACKEND_READ;
     if (events == 0) {
@@ -1329,15 +1480,15 @@ int vox_tcp_write(vox_tcp_t* tcp, const void* buf, size_t len, vox_tcp_write_cb 
     if (!tcp || !buf || len == 0) {
         return -1;
     }
-    
+
     if (tcp->socket.fd == VOX_INVALID_SOCKET) {
         return -1;
     }
-    
+
     if (!tcp->connected) {
         return -1;
     }
-    
+
     vox_mpool_t* mpool = vox_loop_get_mpool(tcp->handle.loop);
     
     /* 如果有待处理的写入请求，直接加入队列 */
@@ -1645,126 +1796,151 @@ static int tcp_start_accept_async(vox_tcp_t* server) {
     if (!server || !server->listening) {
         return -1;
     }
-    
-    if (server->accept_pending) {
-        return 0;  /* 已经有待处理的 AcceptEx 操作 */
-    }
-    
+
     SOCKET listen_sock = (SOCKET)server->socket.fd;
+    vox_mpool_t* mpool = vox_loop_get_mpool(server->handle.loop);
+
+    /* 如果操作池未分配，分配操作池 */
+    if (!server->accept_pool) {
+        server->accept_pool = (vox_tcp_accept_ctx_t*)vox_mpool_alloc(
+            mpool, sizeof(vox_tcp_accept_ctx_t) * VOX_TCP_ACCEPT_POOL_SIZE);
+        if (!server->accept_pool) {
+            VOX_LOG_ERROR("Failed to allocate accept pool");
+            return -1;
+        }
+
+        /* 初始化操作池中的每个上下文 */
+        size_t addr_len = (server->socket.family == VOX_AF_INET) ?
+                          sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+        size_t buffer_size = 2 * (addr_len + 16);
+
+        for (int i = 0; i < VOX_TCP_ACCEPT_POOL_SIZE; i++) {
+            vox_tcp_accept_ctx_t* ctx = &server->accept_pool[i];
+            memset(ctx, 0, sizeof(vox_tcp_accept_ctx_t));
+
+            ctx->ov_ex.io_type = VOX_TCP_IO_ACCEPT;
+            ctx->ov_ex.tcp = server;
+            ctx->socket = INVALID_SOCKET;
+            ctx->buffer_size = buffer_size;
+            ctx->buffer = vox_mpool_alloc(mpool, buffer_size);
+            ctx->pending = false;
+            ctx->index = i;
+
+            if (!ctx->buffer) {
+                VOX_LOG_ERROR("Failed to allocate accept buffer for context %d", i);
+                /* 清理已分配的资源 */
+                for (int j = 0; j < i; j++) {
+                    if (server->accept_pool[j].buffer) {
+                        vox_mpool_free(mpool, server->accept_pool[j].buffer);
+                    }
+                }
+                vox_mpool_free(mpool, server->accept_pool);
+                server->accept_pool = NULL;
+                return -1;
+            }
+        }
+
+        server->accept_pool_size = VOX_TCP_ACCEPT_POOL_SIZE;
+        server->accept_pending_count = 0;
+    }
+
+    /* 获取 AcceptEx 函数指针 */
     LPFN_ACCEPTEX fnAcceptEx = get_acceptex_function(listen_sock);
     if (!fnAcceptEx) {
         VOX_LOG_ERROR("Failed to get AcceptEx function pointer");
         return -1;
     }
-    
-    /* 分配 AcceptEx 缓冲区（需要包含本地和远程地址信息） */
-    vox_mpool_t* mpool = vox_loop_get_mpool(server->handle.loop);
-    if (!server->accept_buffer) {
-        /* AcceptEx 缓冲区大小：2 * (sizeof(sockaddr_in) + 16) + 额外数据 */
-        /* 对于 IPv6，需要 sizeof(sockaddr_in6) + 16 */
-        size_t addr_len = (server->socket.family == VOX_AF_INET) ? 
-                          sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
-        server->accept_buffer_size = 2 * (addr_len + 16);
-        server->accept_buffer = vox_mpool_alloc(mpool, server->accept_buffer_size);
-        if (!server->accept_buffer) {
-            return -1;
-        }
-    }
-    
-    /* 创建一个临时 socket 用于接受连接 */
-    /* AcceptEx 要求先创建一个未绑定的 socket，并且必须使用 WSASocket 创建，包含 WSA_FLAG_OVERLAPPED 标志 */
-    int domain = (server->socket.family == VOX_AF_INET) ? AF_INET : AF_INET6;
-    SOCKET accept_sock = WSASocket(domain, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
-    if (accept_sock == INVALID_SOCKET) {
-        DWORD error = WSAGetLastError();
-        VOX_LOG_ERROR("WSASocket failed, error=%lu", error);
-        return -1;
-    }
-    
-    /* 设置非阻塞 */
-    u_long mode = 1;
-    ioctlsocket(accept_sock, FIONBIO, &mode);
-    
-    /* 将临时 socket 关联到 IOCP（必须在启动 AcceptEx 之前关联） */
-    /* 注意：AcceptEx 要求 socket 在调用前必须关联到 IOCP
-     * 但是，如果我们使用 listen_key 关联，WSARecv 完成事件会路由到 server 句柄
-     * 
-     * 解决方案：我们仍然使用 listen_key 关联，因为这是 AcceptEx 的要求
-     * 在 AcceptEx 完成后，我们会在 vox_tcp_accept 中为客户端 socket 创建自己的 completion key
-     * 但是，由于无法更改 completion key，WSARecv 完成事件仍然会使用 listen_key
-     * 我们需要在事件处理中正确处理这种情况
-     */
+
+    /* 获取 IOCP 实例和 listen_key */
     vox_backend_t* backend = vox_loop_get_backend(server->handle.loop);
-    if (backend && vox_backend_get_type(backend) == VOX_BACKEND_TYPE_IOCP) {
-        /* 获取 IOCP 实例 */
-        vox_iocp_t* iocp = (vox_iocp_t*)vox_backend_get_iocp_impl(backend);
-        if (iocp) {
-            /* 获取 listen_socket 的 completion key */
-            int listen_fd = (int)listen_sock;
-            ULONG_PTR listen_key = vox_iocp_get_completion_key(iocp, listen_fd);
-            
-            if (listen_key != 0) {
-                /* 将 accept_socket 关联到 IOCP，使用 listen_socket 的 completion key */
-                /* AcceptEx 完成时，completion key 就是 listen_socket 的 key */
-                /* 我们可以通过 OVERLAPPED 指针（accept_overlapped）来识别这是 AcceptEx 操作 */
-                if (vox_iocp_associate_socket(iocp, (int)accept_sock, listen_key) != 0) {
-                    DWORD error = WSAGetLastError();
-                    VOX_LOG_ERROR("Failed to associate accept_socket, error=%lu", error);
-                    closesocket(accept_sock);
-                    return -1;
-                }
-            } else {
-                /* listen_socket 没有关联到 IOCP，这是错误的 */
-                VOX_LOG_ERROR("listen_socket has no completion key");
-                closesocket(accept_sock);
-                return -1;
-            }
-        } else {
-            VOX_LOG_ERROR("Failed to get IOCP instance");
-            closesocket(accept_sock);
-            return -1;
-        }
-    } else {
+    if (!backend || vox_backend_get_type(backend) != VOX_BACKEND_TYPE_IOCP) {
         VOX_LOG_ERROR("Not an IOCP backend");
-        closesocket(accept_sock);
         return -1;
     }
-    
-    /* 保存 accept_socket */
-    server->accept_socket = accept_sock;
 
-    /* 设置扩展 OVERLAPPED 结构 */
-    memset(&server->accept_ov_ex.overlapped, 0, sizeof(OVERLAPPED));
-    server->accept_ov_ex.io_type = VOX_TCP_IO_ACCEPT;
-    server->accept_ov_ex.tcp = server;
+    vox_iocp_t* iocp = (vox_iocp_t*)vox_backend_get_iocp_impl(backend);
+    if (!iocp) {
+        VOX_LOG_ERROR("Failed to get IOCP instance");
+        return -1;
+    }
 
-    /* 启动 AcceptEx */
-    DWORD bytes_received = 0;
+    int listen_fd = (int)listen_sock;
+    ULONG_PTR listen_key = vox_iocp_get_completion_key(iocp, listen_fd);
+    if (listen_key == 0) {
+        VOX_LOG_ERROR("listen_socket has no completion key");
+        return -1;
+    }
+
+    /* 遍历操作池，为每个空闲的上下文发起 AcceptEx 操作 */
+    int started = 0;
     size_t addr_len = (server->socket.family == VOX_AF_INET) ?
                       sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
-    BOOL result = fnAcceptEx(
-        listen_sock,
-        accept_sock,
-        server->accept_buffer,
-        0,  /* 不接收额外数据 */
-        (DWORD)(addr_len + 16),  /* 本地地址长度 */
-        (DWORD)(addr_len + 16),  /* 远程地址长度 */
-        &bytes_received,
-        &server->accept_ov_ex.overlapped
-    );
-    
-    if (result == FALSE) {
-        DWORD error = WSAGetLastError();
-        if (error != ERROR_IO_PENDING) {
-            VOX_LOG_ERROR("AcceptEx failed, error=%lu", error);
-            closesocket(accept_sock);
-            server->accept_socket = INVALID_SOCKET;
-            return -1;
+    int domain = (server->socket.family == VOX_AF_INET) ? AF_INET : AF_INET6;
+
+    for (int i = 0; i < server->accept_pool_size; i++) {
+        vox_tcp_accept_ctx_t* ctx = &server->accept_pool[i];
+
+        /* 跳过已经有待处理操作的上下文 */
+        if (ctx->pending) {
+            continue;
         }
+
+        /* 创建 accept socket */
+        SOCKET accept_sock = WSASocket(domain, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
+        if (accept_sock == INVALID_SOCKET) {
+            DWORD error = WSAGetLastError();
+            VOX_LOG_ERROR("WSASocket failed for context %d, error=%lu", i, error);
+            continue;
+        }
+
+        /* 设置非阻塞 */
+        u_long mode = 1;
+        ioctlsocket(accept_sock, FIONBIO, &mode);
+
+        /* 将 accept_socket 关联到 IOCP */
+        if (vox_iocp_associate_socket(iocp, (int)accept_sock, listen_key) != 0) {
+            DWORD error = WSAGetLastError();
+            VOX_LOG_ERROR("Failed to associate accept_socket for context %d, error=%lu", i, error);
+            closesocket(accept_sock);
+            continue;
+        }
+
+        /* 保存 socket */
+        ctx->socket = accept_sock;
+
+        /* 重置 OVERLAPPED 结构 */
+        memset(&ctx->ov_ex.overlapped, 0, sizeof(OVERLAPPED));
+
+        /* 启动 AcceptEx */
+        DWORD bytes_received = 0;
+        BOOL result = fnAcceptEx(
+            listen_sock,
+            accept_sock,
+            ctx->buffer,
+            0,  /* 不接收额外数据 */
+            (DWORD)(addr_len + 16),
+            (DWORD)(addr_len + 16),
+            &bytes_received,
+            &ctx->ov_ex.overlapped
+        );
+
+        if (result == FALSE) {
+            DWORD error = WSAGetLastError();
+            if (error != ERROR_IO_PENDING) {
+                VOX_LOG_ERROR("AcceptEx failed for context %d, error=%lu", i, error);
+                closesocket(accept_sock);
+                ctx->socket = INVALID_SOCKET;
+                continue;
+            }
+        }
+
+        /* 标记为待处理 */
+        ctx->pending = true;
+        server->accept_pending_count++;
+        started++;
     }
-    
-    server->accept_pending = true;
-    return 0;
+
+    return started > 0 ? 0 : -1;
 }
 
 /* 启动异步 WSARecv 操作 */
@@ -1925,10 +2101,11 @@ static int tcp_start_recv_async(vox_tcp_t* tcp) {
         DWORD error = WSAGetLastError();
         if (error != WSA_IO_PENDING) {
             /* 错误 10054 (WSAECONNRESET) 表示连接被重置，可能是客户端关闭了连接 */
+            /* 错误 10053 (WSAECONNABORTED) 表示软件导致连接中止 */
             /* 错误 10057 (WSAENOTCONN) 表示 socket 未连接 */
-            if (error == WSAECONNRESET || error == WSAENOTCONN) {
-                /* 连接被重置或未连接，这是可以接受的（客户端可能关闭了连接） */
-                VOX_LOG_ERROR("WSARecv failed, connection reset or not connected, error=%lu", error);
+            if (error == WSAECONNRESET || error == WSAECONNABORTED || error == WSAENOTCONN) {
+                /* 连接被重置、中止或未连接，这是可以接受的（客户端可能关闭了连接） */
+                VOX_LOG_DEBUG("WSARecv failed, connection reset/abort or not connected, error=%lu", error);
             } else {
                 VOX_LOG_ERROR("WSARecv failed, error=%lu", error);
             }
@@ -1945,11 +2122,16 @@ static int tcp_start_send_async(vox_tcp_t* tcp, const void* buf, size_t len) {
     if (!tcp || !buf || len == 0) {
         return -1;
     }
-    
+
+    /* 检查连接状态 */
+    if (tcp->socket.fd == VOX_INVALID_SOCKET || !tcp->connected) {
+        return -1;
+    }
+
     if (tcp->send_pending) {
         return -1;  /* 已经有待处理的 WSASend 操作，应该加入队列 */
     }
-    
+
     SOCKET sock = (SOCKET)tcp->socket.fd;
     
     /* 准备 WSABUF 数组 */
@@ -1986,10 +2168,18 @@ static int tcp_start_send_async(vox_tcp_t* tcp, const void* buf, size_t len) {
     if (result == SOCKET_ERROR) {
         DWORD error = WSAGetLastError();
         if (error != WSA_IO_PENDING) {
+            /* 错误 10054 (WSAECONNRESET) 表示连接被重置 */
+            /* 错误 10053 (WSAECONNABORTED) 表示软件导致连接中止 */
+            /* 错误 10057 (WSAENOTCONN) 表示 socket 未连接 */
+            if (error == WSAECONNRESET || error == WSAECONNABORTED || error == WSAENOTCONN) {
+                VOX_LOG_WARN("WSASend failed, connection reset/abort or not connected, error=%lu", error);
+            } else {
+                VOX_LOG_ERROR("WSASend failed, error=%lu", error);
+            }
             return -1;
         }
     }
-    
+
     tcp->send_pending = true;
     return 0;
 }

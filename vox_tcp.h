@@ -54,6 +54,23 @@ typedef struct {
     vox_tcp_io_type_t io_type;      /* IO 操作类型 */
     struct vox_tcp* tcp;            /* 指向 TCP 句柄的指针 */
 } vox_tcp_overlapped_ex_t;
+
+/* AcceptEx 操作池大小（同时发起的 AcceptEx 操作数量）
+ * 512 个并发操作可以处理极高并发的连接请求（如 wrk -c1000+）
+ * 这是一个比较激进的设置，适用于需要极致性能的场景
+ * 注意：每个操作会占用约 256 字节内存（socket + buffer + OVERLAPPED），512 个约占用 128KB */
+#define VOX_TCP_ACCEPT_POOL_SIZE 512
+
+/* AcceptEx 操作上下文（用于支持多个并发 AcceptEx 操作）
+ * 每个上下文包含独立的 socket、buffer 和 OVERLAPPED 结构 */
+typedef struct {
+    vox_tcp_overlapped_ex_t ov_ex;  /* 扩展 OVERLAPPED 结构 */
+    SOCKET socket;                   /* AcceptEx 使用的客户端 socket */
+    void* buffer;                    /* AcceptEx 缓冲区（包含地址信息） */
+    size_t buffer_size;              /* 缓冲区大小 */
+    bool pending;                    /* 是否有待处理的操作 */
+    int index;                       /* 在池中的索引 */
+} vox_tcp_accept_ctx_t;
 #endif
 
 /* TCP 句柄结构 */
@@ -90,14 +107,14 @@ struct vox_tcp {
     /* Windows IOCP 异步 IO 支持（使用扩展 OVERLAPPED 结构） */
     vox_tcp_overlapped_ex_t read_ov_ex;    /* 读取操作的扩展 OVERLAPPED */
     vox_tcp_overlapped_ex_t write_ov_ex;   /* 写入操作的扩展 OVERLAPPED */
-    vox_tcp_overlapped_ex_t accept_ov_ex;  /* 接受连接操作的扩展 OVERLAPPED */
     vox_tcp_overlapped_ex_t connect_ov_ex; /* 连接操作的扩展 OVERLAPPED */
 
-    /* AcceptEx 相关 */
-    void* accept_buffer;                   /* AcceptEx 缓冲区（包含地址信息） */
-    size_t accept_buffer_size;             /* AcceptEx 缓冲区大小 */
-    SOCKET accept_socket;                  /* AcceptEx 使用的客户端 socket（待接受） */
-    bool accept_pending;                   /* 是否有待处理的 AcceptEx 操作 */
+    /* AcceptEx 操作池（支持多个并发 AcceptEx 操作以处理高并发连接）
+     * 使用操作池可以同时发起多个 AcceptEx 操作，显著提升高并发场景下的连接接受能力 */
+    vox_tcp_accept_ctx_t* accept_pool;     /* AcceptEx 操作池数组 */
+    int accept_pool_size;                  /* 操作池大小 */
+    int accept_pending_count;              /* 当前待处理的 AcceptEx 操作数量 */
+    SOCKET accept_socket;                  /* 临时字段：当前接受的 socket（用于传递给 vox_tcp_accept） */
 
     /* WSARecv 相关 */
     WSABUF* recv_bufs;                     /* WSARecv 缓冲区数组 */

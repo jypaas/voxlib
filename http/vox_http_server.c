@@ -298,6 +298,7 @@ static void vox_http_conn_close(vox_http_conn_t* c) {
         }
     } else {
         if (c->tcp) {
+            /* 在关闭TCP连接前，确保停止所有读取操作 */
             vox_tcp_read_stop(c->tcp);
             if (!vox_handle_is_closing((vox_handle_t*)c->tcp)) {
                 vox_handle_close((vox_handle_t*)c->tcp, vox_http_conn_on_handle_closed);

@@ -346,10 +346,46 @@ static void udp_process_send_queue(vox_udp_t* udp) {
     if (!udp || !udp->send_queue) {
         return;
     }
-    
+
     vox_mpool_t* mpool = vox_loop_get_mpool(udp->handle.loop);
+
+#ifdef VOX_OS_WINDOWS
+    /* Windows IOCP: 检查是否使用 IOCP backend，如果是则使用异步 WSASendTo */
+    vox_backend_t* backend = vox_loop_get_backend(udp->handle.loop);
+    if (backend && vox_backend_get_type(backend) == VOX_BACKEND_TYPE_IOCP) {
+        /* IOCP 模式：一次只处理队列头的一个请求（使用异步 WSASendTo） */
+        vox_udp_send_req_t* req = (vox_udp_send_req_t*)udp->send_queue;
+
+        /* 如果没有待处理的发送操作，启动异步 WSASendTo */
+        if (!udp->send_pending) {
+            if (udp_start_send_async(udp, req->buf, req->len, &req->addr) != 0) {
+                /* WSASendTo 失败（通常是连接被关闭或网络错误） */
+                vox_udp_send_cb cb = req->cb;
+                vox_udp_send_req_t* next = req->next;
+
+                udp->send_queue = (void*)next;
+
+                if (cb) {
+                    cb(udp, -1, vox_handle_get_data((vox_handle_t*)udp));
+                }
+
+                vox_mpool_free(mpool, req);
+
+                /* 继续处理下一个请求（虽然可能也会失败） */
+                if (next) {
+                    udp_process_send_queue(udp);
+                }
+            }
+            /* WSASendTo 成功提交，等待 IOCP 完成通知 */
+        }
+        /* 如果已有待处理的发送操作，等待其完成后会再次调用本函数 */
+        return;
+    }
+#endif
+
+    /* 非 IOCP 模式：使用同步 sendto + 可写事件通知 */
     vox_udp_send_req_t* req = (vox_udp_send_req_t*)udp->send_queue;
-    
+
     while (req) {
         /* 尝试发送数据 */
         int64_t nsent = vox_socket_sendto(&udp->socket, req->buf, req->len, &req->addr);
@@ -1086,14 +1122,22 @@ static int udp_start_send_async(vox_udp_t* udp, const void* buf, size_t len, con
         &udp->send_ov_ex.overlapped,
         NULL
     );
-    
+
     if (result == SOCKET_ERROR) {
         DWORD error = WSAGetLastError();
         if (error != WSA_IO_PENDING) {
+            /* 错误 10054 (WSAECONNRESET) 表示连接被重置 */
+            /* 错误 10053 (WSAECONNABORTED) 表示软件导致连接中止 */
+            /* 错误 10057 (WSAENOTCONN) 表示 socket 未连接 */
+            if (error == WSAECONNRESET || error == WSAECONNABORTED || error == WSAENOTCONN) {
+                VOX_LOG_WARN("WSASendTo failed, connection reset/abort or not connected, error=%lu", error);
+            } else {
+                VOX_LOG_ERROR("WSASendTo failed, error=%lu", error);
+            }
             return -1;
         }
     }
-    
+
     udp->send_pending = true;
     return 0;
 }
