@@ -55,6 +55,12 @@ typedef struct {
     /* 固定布局：始终保留字段，避免与未定义 VOX_USE_WEBSOCKET 的调用方 ABI 不一致导致越界访问 */
     const char* ws_path;         /* 非 NULL 则 MQTT over WebSocket（如 "/mqtt"）；需 VOX_USE_WEBSOCKET 才生效 */
     size_t ws_path_len;         /* 0 表示 strlen(ws_path) */
+
+    /* 自动重连配置 */
+    bool enable_auto_reconnect;        /* 是否启用自动重连（默认 false） */
+    uint32_t max_reconnect_attempts;   /* 最大重连次数，0 表示无限重试（默认 0） */
+    uint32_t initial_reconnect_delay_ms; /* 初始重连延迟（默认 1000ms） */
+    uint32_t max_reconnect_delay_ms;   /* 最大重连延迟（默认 60000ms） */
 } vox_mqtt_connect_options_t;
 
 /** 连接结果回调：status 0=成功，非0=失败（见 CONNACK 或连接错误） */
@@ -65,6 +71,10 @@ typedef void (*vox_mqtt_message_cb)(vox_mqtt_client_t* client,
     const char* topic, size_t topic_len,
     const void* payload, size_t payload_len,
     uint8_t qos, bool retain, void* user_data);
+
+/** 订阅枚举回调：遍历当前所有订阅时调用 */
+typedef void (*vox_mqtt_subscription_cb)(const char* topic_filter, size_t topic_filter_len,
+    uint8_t qos, void* user_data);
 
 /** 订阅确认：packet_id 与 subscribe 时一致，return_codes 数组长度为订阅数 */
 typedef void (*vox_mqtt_suback_cb)(vox_mqtt_client_t* client, uint16_t packet_id,
@@ -107,6 +117,10 @@ int vox_mqtt_client_subscribe(vox_mqtt_client_t* client,
 /** 取消订阅 */
 int vox_mqtt_client_unsubscribe(vox_mqtt_client_t* client,
     const char* topic_filter, size_t topic_filter_len);
+
+/** 遍历当前所有订阅：对每个订阅调用回调函数 */
+void vox_mqtt_client_foreach_subscription(vox_mqtt_client_t* client,
+    vox_mqtt_subscription_cb cb, void* user_data);
 
 /** 设置回调（可在 connect 前或后调用） */
 void vox_mqtt_client_set_message_cb(vox_mqtt_client_t* client, vox_mqtt_message_cb cb, void* user_data);

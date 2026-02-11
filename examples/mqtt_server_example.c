@@ -1,6 +1,13 @@
 /*
  * mqtt_server_example.c - MQTT 服务端示例
  *
+ * 功能：
+ *   - 支持 MQTT 3.1, 3.1.1, MQTT 5
+ *   - Topic 路由引擎（支持 +, # 通配符）
+ *   - Retained Messages（自动保存和分发）
+ *   - Will Message（异常断开时发布）
+ *   - QoS 0/1/2 完整支持
+ *
  * 用法：mqtt_server_example [tcp_port] [ws_port]
  * 默认 tcp_port=1883；若提供 ws_port（如 8080）则同时监听 MQTT over WebSocket，path 为 /mqtt
  * 示例：mqtt_server_example 1883 8080  → TCP 1883 + WS 8080
@@ -33,8 +40,9 @@ static void on_publish(vox_mqtt_connection_t* conn, const char* topic, size_t to
     const void* payload, size_t payload_len, uint8_t qos, void* user_data) {
     (void)conn;
     (void)user_data;
-    printf("[mqtt server] publish topic=%.*s payload=%.*s qos=%u\n",
-        (int)topic_len, topic, (int)payload_len, (const char*)payload, qos);
+    printf("[mqtt server] received: topic=%.*s, qos=%u, payload=%.*s\n",
+        (int)topic_len, topic, qos, (int)payload_len, (const char*)payload);
+    printf("[mqtt server] → routing to subscribers (with wildcard matching)\n");
 }
 
 int main(int argc, char** argv) {

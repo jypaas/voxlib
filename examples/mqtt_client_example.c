@@ -44,6 +44,20 @@ static int g_do_pub = 0;
 static int g_pub_done = 0;
 static int g_sub_done = 0;
 
+/* 自动重连选项 */
+static int g_auto_reconnect = 0;
+static uint32_t g_reconnect_delay_ms = 1000;
+static uint32_t g_max_reconnect_attempts = 0;  /* 0 = 无限重试 */
+
+/* Will Message 选项 */
+static const char* g_will_topic = NULL;
+static const char* g_will_message = NULL;
+static uint8_t g_will_qos = 0;
+
+/* QoS 选项 */
+static uint8_t g_pub_qos = 1;  /* 默认 QoS 1 */
+static uint8_t g_sub_qos = 1;  /* 默认 QoS 1 */
+
 /* 订阅主题列表（指针指向 argv，无 malloc） */
 static const char* g_sub_topics[MAX_SUB_TOPICS];
 static int g_sub_count = 0;
@@ -56,7 +70,10 @@ static void on_connect(vox_mqtt_client_t* client, int status, void* user_data) {
     (void)user_data;
     if (status != 0) {
         fprintf(stderr, "[mqtt client] connect failed, status=%d\n", status);
-        if (g_loop) vox_loop_stop(g_loop);
+        /* 如果启用了自动重连，不要停止循环，让重连机制处理 */
+        if (!g_auto_reconnect && g_loop) {
+            vox_loop_stop(g_loop);
+        }
         return;
     }
     printf("[mqtt client] connected\n");
@@ -65,10 +82,10 @@ static void on_connect(vox_mqtt_client_t* client, int status, void* user_data) {
     for (int i = 0; i < g_sub_count; i++) {
         const char* topic = g_sub_topics[i];
         size_t len = strlen(topic);
-        if (vox_mqtt_client_subscribe(client, topic, len, 1, NULL, NULL) != 0) {
+        if (vox_mqtt_client_subscribe(client, topic, len, g_sub_qos, NULL, NULL) != 0) {
             fprintf(stderr, "[mqtt client] subscribe failed: %s\n", topic);
         } else {
-            printf("[mqtt client] subscribed: %s\n", topic);
+            printf("[mqtt client] subscribed: %s (QoS %u)\n", topic, g_sub_qos);
         }
     }
     if (g_sub_count > 0) g_sub_done = 1;
@@ -78,16 +95,17 @@ static void on_connect(vox_mqtt_client_t* client, int status, void* user_data) {
         const char* topic = g_pub_topic_msg[i * 2];
         const char* msg  = g_pub_topic_msg[i * 2 + 1];
         if (!topic || !msg) continue;
-        if (vox_mqtt_client_publish(client, topic, strlen(topic), msg, strlen(msg), 1, false) != 0) {
+        if (vox_mqtt_client_publish(client, topic, strlen(topic), msg, strlen(msg), g_pub_qos, false) != 0) {
             fprintf(stderr, "[mqtt client] publish failed: %s\n", topic);
         } else {
-            printf("[mqtt client] published: %s -> %s\n", topic, msg);
+            printf("[mqtt client] published: %s -> %s (QoS %u)\n", topic, msg, g_pub_qos);
         }
     }
     if (g_pub_count > 0) g_pub_done = 1;
 
-    /* 若仅发布且未订阅，发布完后断开并退出 */
-    if (g_pub_done && !g_do_sub) {
+    /* 若仅发布且未订阅，发布完后断开并退出
+     * 注意：QoS 1/2 需要等待握手完成，所以只有 QoS 0 才立即断开 */
+    if (g_pub_done && !g_do_sub && g_pub_qos == 0) {
         vox_mqtt_client_disconnect(client);
         if (g_loop) vox_loop_stop(g_loop);
     }
@@ -99,9 +117,9 @@ static void on_message(vox_mqtt_client_t* client,
     uint8_t qos, bool retain, void* user_data) {
     (void)client;
     (void)user_data;
-    (void)qos;
-    (void)retain;
-    printf("[msg] %.*s -> %.*s\n", (int)topic_len, topic, (int)payload_len, (const char*)payload);
+    printf("[msg] topic=%.*s, qos=%u, retain=%d, payload=%.*s\n",
+        (int)topic_len, topic, qos, retain ? 1 : 0,
+        (int)payload_len, (const char*)payload);
 }
 
 static void on_disconnect(vox_mqtt_client_t* client, void* user_data) {
@@ -124,19 +142,25 @@ static void sigint_cb(int sig) {
 static void print_usage(const char* prog) {
     fprintf(stderr,
         "Usage: %s [options] <host> [port]\n"
+        "Options:\n"
         "  -5, --mqtt5           Use MQTT 5 (default: 3.1.1)\n"
         "  -i, --id <id>         Client ID\n"
-        "  -s, --sub <topic>     Subscribe (repeatable)\n"
-        "  -P, --pub <topic> <msg> Publish (repeatable)\n"
+        "  -s, --sub <topic>     Subscribe topic (repeatable)\n"
+        "  -P, --pub <topic> <msg> Publish message (repeatable)\n"
         "  -k, --keepalive <sec> Keepalive seconds (default 60)\n"
-        "  -r, --reconnect      Auto reconnect on disconnect\n"
-        "  -R, --reconnect-ms <ms> Reconnect interval ms (default 5000)\n"
+        "  -q, --qos <0|1|2>     QoS for publish/subscribe (default 1)\n"
+        "  -r, --reconnect       Enable auto reconnect\n"
+        "  -R, --reconnect-delay <ms> Reconnect delay ms (default 1000)\n"
+        "  -M, --max-reconnect <n> Max reconnect attempts (0=infinite, default 0)\n"
+        "  -w, --will <topic> <msg> <qos> Set will message\n"
         "  -h, --help            Show this help\n"
         "Examples:\n"
-        "  %s -s sensor/temp localhost 1883\n"
-        "  %s -r -s test/# localhost\n"
-        "  %s -5 -s test/# -P test/one msg localhost\n",
-        prog, prog, prog, prog);
+        "  Subscribe:  %s -s sensor/temp localhost 1883\n"
+        "  Publish:    %s -P test/topic \"hello\" localhost\n"
+        "  QoS 2:      %s -q 2 -P test/qos2 \"reliable\" localhost\n"
+        "  Reconnect:  %s -r -s test/# localhost\n"
+        "  Will msg:   %s -w offline/client \"disconnected\" 1 -s test/# localhost\n",
+        prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char** argv) {
@@ -188,6 +212,41 @@ int main(int argc, char** argv) {
             int k = atoi(argv[++i]);
             keepalive = (k > 0 && k <= 65535) ? (uint16_t)k : 60;
             i++;
+            continue;
+        }
+        if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--qos") == 0) {
+            if (i + 1 >= argc) { fprintf(stderr, "missing value for %s\n", argv[i]); return 1; }
+            int q = atoi(argv[++i]);
+            if (q >= 0 && q <= 2) {
+                g_pub_qos = g_sub_qos = (uint8_t)q;
+            }
+            i++;
+            continue;
+        }
+        if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--reconnect") == 0) {
+            g_auto_reconnect = 1;
+            i++;
+            continue;
+        }
+        if (strcmp(argv[i], "-R") == 0 || strcmp(argv[i], "--reconnect-delay") == 0) {
+            if (i + 1 >= argc) { fprintf(stderr, "missing value for %s\n", argv[i]); return 1; }
+            g_reconnect_delay_ms = (uint32_t)atoi(argv[++i]);
+            i++;
+            continue;
+        }
+        if (strcmp(argv[i], "-M") == 0 || strcmp(argv[i], "--max-reconnect") == 0) {
+            if (i + 1 >= argc) { fprintf(stderr, "missing value for %s\n", argv[i]); return 1; }
+            g_max_reconnect_attempts = (uint32_t)atoi(argv[++i]);
+            i++;
+            continue;
+        }
+        if (strcmp(argv[i], "-w") == 0 || strcmp(argv[i], "--will") == 0) {
+            if (i + 3 >= argc) { fprintf(stderr, "missing topic, message, qos for %s\n", argv[i]); return 1; }
+            g_will_topic = argv[i + 1];
+            g_will_message = argv[i + 2];
+            g_will_qos = (uint8_t)atoi(argv[i + 3]);
+            if (g_will_qos > 2) g_will_qos = 0;
+            i += 4;
             continue;
         }
         if (argv[i][0] == '-') {
@@ -252,10 +311,42 @@ int main(int argc, char** argv) {
     opts.use_mqtt5       = (bool)use_mqtt5;
     opts.username        = NULL;
     opts.password        = NULL;
-    opts.will_topic      = NULL;
-    opts.ws_path         = NULL;
 
-    printf("[mqtt client] connecting to %s:%u (%s)\n", host, port, use_mqtt5 ? "MQTT 5" : "MQTT 3.1.1");
+    /* Will Message 配置 */
+    if (g_will_topic && g_will_message) {
+        opts.will_topic = g_will_topic;
+        opts.will_topic_len = strlen(g_will_topic);
+        opts.will_msg = g_will_message;
+        opts.will_msg_len = strlen(g_will_message);
+        opts.will_qos = g_will_qos;
+        opts.will_retain = false;
+        printf("[mqtt client] will message: topic=%s, msg=%s, qos=%u\n",
+            g_will_topic, g_will_message, g_will_qos);
+    } else {
+        opts.will_topic = NULL;
+    }
+
+    /* 自动重连配置 */
+    opts.enable_auto_reconnect = g_auto_reconnect;
+    opts.max_reconnect_attempts = g_max_reconnect_attempts;
+    opts.initial_reconnect_delay_ms = g_reconnect_delay_ms;
+    opts.max_reconnect_delay_ms = 60000;
+    if (g_auto_reconnect) {
+        printf("[mqtt client] auto reconnect enabled: delay=%ums, max_attempts=%u\n",
+            g_reconnect_delay_ms, g_max_reconnect_attempts);
+    }
+
+    opts.ws_path = NULL;
+
+    printf("[mqtt client] connecting to %s:%u (%s, QoS=%u)\n",
+        host, port, use_mqtt5 ? "MQTT 5" : "MQTT 3.1.1", g_pub_qos);
+    if (g_will_topic) {
+        printf("[mqtt client] will message configured\n");
+    }
+    if (g_auto_reconnect) {
+        printf("[mqtt client] auto reconnect: delay=%ums, max=%u attempts\n",
+            opts.initial_reconnect_delay_ms, opts.max_reconnect_attempts);
+    }
 
     if (vox_mqtt_client_connect(g_client, host, port, &opts, on_connect, NULL) != 0) {
         fprintf(stderr, "[mqtt client] connect start failed\n");

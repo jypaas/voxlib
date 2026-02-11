@@ -51,6 +51,16 @@ typedef struct vox_mqtt_srv_pending_qos2_out {
     uint8_t state; /* 0=等 PUBREC，1=等 PUBCOMP */
 } vox_mqtt_srv_pending_qos2_out_t;
 
+/* Retained Message（保留消息） */
+typedef struct vox_mqtt_retained_msg {
+    vox_list_node_t node;
+    char* topic;
+    size_t topic_len;
+    void* payload;
+    size_t payload_len;
+    uint8_t qos;
+} vox_mqtt_retained_msg_t;
+
 struct vox_mqtt_connection {
     vox_mqtt_server_t* server;
     vox_tcp_t* tcp;
@@ -73,6 +83,21 @@ struct vox_mqtt_connection {
     vox_list_t pending_qos2_in_list;   /* 来自客户端的 QoS 2，已回 PUBREC，待 PUBREL */
     vox_list_t pending_qos2_out_list;  /* 发往该客户端的 QoS 2，待 PUBREC/PUBCOMP */
     void* user_data;
+
+    /* Will Message（遗嘱消息） */
+    bool has_will;                /* 是否设置了遗嘱消息 */
+    bool clean_disconnect;        /* 是否正常断开（收到 DISCONNECT） */
+    char* will_topic;             /* 遗嘱主题 */
+    size_t will_topic_len;
+    void* will_payload;           /* 遗嘱消息内容 */
+    size_t will_payload_len;
+    uint8_t will_qos;             /* 遗嘱消息 QoS */
+    bool will_retain;             /* 遗嘱消息 retain 标志 */
+    uint32_t will_delay_interval; /* MQTT 5: 延迟发布遗嘱的时间（秒），0 表示立即 */
+
+    /* MQTT 5: Topic Alias（主题别名） */
+    uint16_t topic_alias_maximum; /* 客户端支持的最大 topic alias 数量 */
+    char** topic_alias_map;       /* Topic alias 映射数组：alias -> topic */
 };
 
 struct vox_mqtt_server {
@@ -89,6 +114,7 @@ struct vox_mqtt_server {
 #endif
     vox_mqtt_server_config_t config;
     vox_list_t connections;
+    vox_list_t retained_messages;  /* Retained messages 列表 */
 };
 
 /* MQTT topic 匹配：filter 可含 +（单层）和 #（多层级）；快速路径减少高并发下开销 */
@@ -128,11 +154,27 @@ wildcard_path:
 
 static void tcp_read_cb(vox_tcp_t* tcp, ssize_t nread, const void* buf, void* user_data);
 
+static void forward_message_to_subscribers(vox_mqtt_server_t* s, vox_mqtt_connection_t* from_conn,
+    const char* topic, size_t topic_len, const void* payload, size_t payload_len, uint8_t qos, bool retain);
+
 static void conn_close(vox_mqtt_connection_t* conn) {
     if (!conn) return;
     vox_mqtt_server_t* s = conn->server;
     vox_list_remove(&s->connections, &conn->node);
     if (s->config.on_disconnect) s->config.on_disconnect(conn, s->config.user_data);
+
+    /* 发布 Will Message（仅在异常断开时） */
+    if (conn->has_will && !conn->clean_disconnect && conn->will_topic) {
+        VOX_LOG_DEBUG("MQTT server: publishing will message for client %.*s, topic=%.*s",
+            (int)conn->client_id_len, conn->client_id,
+            (int)conn->will_topic_len, conn->will_topic);
+
+        /* 使用消息路由引擎发布 will message */
+        forward_message_to_subscribers(s, conn, conn->will_topic, conn->will_topic_len,
+            conn->will_payload, conn->will_payload_len,
+            conn->will_qos, conn->will_retain);
+    }
+
     vox_list_node_t* pos, * n;
     vox_list_for_each_safe(pos, n, &conn->pending_writes) {
         vox_mqtt_pending_write_t* pw = VOX_CONTAINING_RECORD(pos, vox_mqtt_pending_write_t, node);
@@ -147,6 +189,21 @@ static void conn_close(vox_mqtt_connection_t* conn) {
         vox_mpool_free(s->mpool, sub);
     }
     if (conn->client_id) vox_mpool_free(s->mpool, conn->client_id);
+
+    /* 清理 Will Message */
+    if (conn->will_topic) vox_mpool_free(s->mpool, conn->will_topic);
+    if (conn->will_payload) vox_mpool_free(s->mpool, conn->will_payload);
+
+    /* 清理 Topic Alias Map */
+    if (conn->topic_alias_map) {
+        for (uint16_t i = 0; i < conn->topic_alias_maximum; i++) {
+            if (conn->topic_alias_map[i]) {
+                vox_mpool_free(s->mpool, conn->topic_alias_map[i]);
+            }
+        }
+        vox_mpool_free(s->mpool, conn->topic_alias_map);
+    }
+
     if (conn->parser) vox_mqtt_parser_destroy(conn->parser);
 #if defined(VOX_USE_WEBSOCKET) && VOX_USE_WEBSOCKET
     if (conn->ws_conn) {
@@ -305,6 +362,38 @@ static int on_connect(void* user_data, const char* client_id, size_t client_id_l
         }
     }
 
+    /* 保存 Will Message（遗嘱消息） */
+    /* flags 格式：bit 2 = will flag, bit 3-4 = will qos, bit 5 = will retain */
+    bool will_flag = (flags & 0x04) != 0;
+    if (will_flag && will_topic && will_topic_len > 0) {
+        conn->has_will = true;
+        conn->will_qos = (flags >> 3) & 0x03;  /* bits 3-4 */
+        conn->will_retain = (flags & 0x20) != 0;  /* bit 5 */
+
+        /* 深拷贝 will topic */
+        conn->will_topic = (char*)vox_mpool_alloc(s->mpool, will_topic_len + 1);
+        if (conn->will_topic) {
+            memcpy(conn->will_topic, will_topic, will_topic_len);
+            conn->will_topic[will_topic_len] = '\0';
+            conn->will_topic_len = will_topic_len;
+        }
+
+        /* 深拷贝 will payload */
+        if (will_msg && will_msg_len > 0) {
+            conn->will_payload = vox_mpool_alloc(s->mpool, will_msg_len);
+            if (conn->will_payload) {
+                memcpy(conn->will_payload, will_msg, will_msg_len);
+                conn->will_payload_len = will_msg_len;
+            }
+        }
+
+        /* MQTT 5: Will Delay Interval 从 CONNECT 属性中获取（暂时默认为 0） */
+        conn->will_delay_interval = 0;
+
+        VOX_LOG_DEBUG("MQTT server: saved will message for client %.*s, topic=%.*s, qos=%u",
+            (int)client_id_len, client_id, (int)will_topic_len, will_topic, conn->will_qos);
+    }
+
     /* 按协商版本回包：v5 用 CONNACK v5（回显 Session Expiry / Receive Maximum 或默认），否则 3.1.1 */
     size_t need;
     if (conn->protocol_version == VOX_MQTT_VERSION_5) {
@@ -344,6 +433,37 @@ static int on_subscribe(void* user_data, uint16_t packet_id, const char* topic_f
     sub->len = topic_len;
     sub->qos = qos > 1 ? 1 : qos;
     vox_list_push_back(&conn->subscriptions, &sub->node);
+
+    /* 发送匹配的 Retained Messages */
+    vox_list_node_t* rm_pos;
+    vox_list_for_each(rm_pos, &s->retained_messages) {
+        vox_mqtt_retained_msg_t* rm = VOX_CONTAINING_RECORD(rm_pos, vox_mqtt_retained_msg_t, node);
+        if (topic_match(topic_filter, topic_len, rm->topic, rm->topic_len)) {
+            /* 匹配成功，发送 retained message */
+            uint8_t grant_qos = (sub->qos < rm->qos) ? sub->qos : rm->qos;
+            int use_v5 = (conn->protocol_version == VOX_MQTT_VERSION_5);
+            size_t need = use_v5
+                ? vox_mqtt_encode_publish_v5(NULL, 0, grant_qos, true, 0, rm->topic, rm->topic_len, rm->payload, rm->payload_len)
+                : vox_mqtt_encode_publish(NULL, 0, grant_qos, true, 0, rm->topic, rm->topic_len, rm->payload, rm->payload_len);
+            if (need > 0) {
+                uint8_t* buf = (uint8_t*)vox_mpool_alloc(s->mpool, need);
+                if (buf) {
+                    uint16_t pid = 0;
+                    if (grant_qos > 0) {
+                        if (++conn->next_packet_id == 0) conn->next_packet_id = 1;
+                        pid = conn->next_packet_id;
+                    }
+                    if (use_v5) {
+                        vox_mqtt_encode_publish_v5(buf, need, grant_qos, true, pid, rm->topic, rm->topic_len, rm->payload, rm->payload_len);
+                    } else {
+                        vox_mqtt_encode_publish(buf, need, grant_qos, true, pid, rm->topic, rm->topic_len, rm->payload, rm->payload_len);
+                    }
+                    conn_send(conn, buf, need);
+                }
+            }
+        }
+    }
+
     return (int)sub->qos;  /* 授予的 qos */
 }
 
@@ -446,6 +566,62 @@ static void forward_message_to_subscribers(vox_mqtt_server_t* s, vox_mqtt_connec
                     }
                 }
                 break;
+            }
+        }
+    }
+
+    /* 处理 Retained Message */
+    if (retain) {
+        /* 查找是否已有相同 topic 的 retained message */
+        vox_mqtt_retained_msg_t* existing = NULL;
+        vox_list_node_t* rm_pos;
+        vox_list_for_each(rm_pos, &s->retained_messages) {
+            vox_mqtt_retained_msg_t* rm = VOX_CONTAINING_RECORD(rm_pos, vox_mqtt_retained_msg_t, node);
+            if (rm->topic_len == topic_len && memcmp(rm->topic, topic, topic_len) == 0) {
+                existing = rm;
+                break;
+            }
+        }
+
+        if (payload_len == 0) {
+            /* payload 为空，删除 retained message */
+            if (existing) {
+                vox_list_remove(&s->retained_messages, &existing->node);
+                if (existing->topic) vox_mpool_free(s->mpool, existing->topic);
+                if (existing->payload) vox_mpool_free(s->mpool, existing->payload);
+                vox_mpool_free(s->mpool, existing);
+            }
+        } else {
+            /* payload 不为空，保存或更新 retained message */
+            if (existing) {
+                /* 更新已有的 retained message */
+                if (existing->payload) vox_mpool_free(s->mpool, existing->payload);
+                existing->payload = vox_mpool_alloc(s->mpool, payload_len);
+                if (existing->payload) {
+                    memcpy(existing->payload, payload, payload_len);
+                    existing->payload_len = payload_len;
+                    existing->qos = qos;
+                }
+            } else {
+                /* 创建新的 retained message */
+                vox_mqtt_retained_msg_t* rm = (vox_mqtt_retained_msg_t*)
+                    vox_mpool_alloc(s->mpool, sizeof(vox_mqtt_retained_msg_t));
+                if (rm) {
+                    memset(rm, 0, sizeof(*rm));
+                    rm->topic = (char*)vox_mpool_alloc(s->mpool, topic_len + 1);
+                    if (rm->topic) {
+                        memcpy(rm->topic, topic, topic_len);
+                        rm->topic[topic_len] = '\0';
+                        rm->topic_len = topic_len;
+                    }
+                    rm->payload = vox_mpool_alloc(s->mpool, payload_len);
+                    if (rm->payload) {
+                        memcpy(rm->payload, payload, payload_len);
+                        rm->payload_len = payload_len;
+                    }
+                    rm->qos = qos;
+                    vox_list_push_back(&s->retained_messages, &rm->node);
+                }
             }
         }
     }
@@ -577,6 +753,15 @@ static int on_pingreq(void* user_data) {
     return 0;
 }
 
+static int on_disconnect_from_client(void* user_data) {
+    vox_mqtt_connection_t* conn = (vox_mqtt_connection_t*)user_data;
+    /* 客户端正常断开，标记为 clean disconnect，不发布 will message */
+    conn->clean_disconnect = true;
+    VOX_LOG_DEBUG("MQTT server: client %.*s sent DISCONNECT, will message cleared",
+        (int)conn->client_id_len, conn->client_id);
+    return 0;
+}
+
 static int on_error_conn(void* user_data, const char* message) {
     vox_mqtt_connection_t* conn = (vox_mqtt_connection_t*)user_data;
     (void)message;
@@ -606,6 +791,7 @@ static vox_mqtt_connection_t* conn_create_common(vox_mqtt_server_t* s) {
     pcb.on_pubrel = on_pubrel_from_client;
     pcb.on_pubcomp = on_pubcomp_from_client;
     pcb.on_pingreq = on_pingreq;
+    pcb.on_disconnect = on_disconnect_from_client;
     pcb.on_error = on_error_conn;
     pcb.user_data = conn;
     conn->parser = vox_mqtt_parser_create(s->mpool, &pcfg, &pcb);
@@ -766,6 +952,7 @@ vox_mqtt_server_t* vox_mqtt_server_create(const vox_mqtt_server_config_t* config
     s->owns_mpool = own;
     s->config = *config;
     vox_list_init(&s->connections);
+    vox_list_init(&s->retained_messages);
     return s;
 }
 
@@ -777,6 +964,16 @@ void vox_mqtt_server_destroy(vox_mqtt_server_t* s) {
         vox_mqtt_connection_t* c = VOX_CONTAINING_RECORD(pos, vox_mqtt_connection_t, node);
         conn_close(c);
     }
+
+    /* 清理 Retained Messages */
+    vox_list_for_each_safe(pos, n, &s->retained_messages) {
+        vox_mqtt_retained_msg_t* rm = VOX_CONTAINING_RECORD(pos, vox_mqtt_retained_msg_t, node);
+        vox_list_remove(&s->retained_messages, pos);
+        if (rm->topic) vox_mpool_free(s->mpool, rm->topic);
+        if (rm->payload) vox_mpool_free(s->mpool, rm->payload);
+        vox_mpool_free(s->mpool, rm);
+    }
+
     if (s->owns_mpool && s->mpool) vox_mpool_destroy(s->mpool);
 }
 

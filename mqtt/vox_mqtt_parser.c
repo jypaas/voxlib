@@ -96,21 +96,13 @@ static void set_error(vox_mqtt_parser_t* p, const char* msg) {
     if (p->cb.on_error) p->cb.on_error(p->cb.user_data, msg);
 }
 
-/* 读取 UTF-8 字符串：2 字节长度 + 数据 */
-VOX_UNUSED_FUNC static int read_utf8(const uint8_t* data, size_t len, size_t* consumed, const char** out_ptr, size_t* out_len) {
-    if (len < 2) return -1;
-    uint16_t n = (uint16_t)((data[0] << 8) | data[1]);
-    *consumed = 2 + n;
-    if (len < *consumed) return -1;
-    *out_ptr = (const char*)(data + 2);
-    *out_len = n;
-    return 0;
-}
-
 /* 属性值长度常量，便于 property_value_skip 使用 */
 #define VOX_MQTT5_PROP_LEN_4  4
 #define VOX_MQTT5_PROP_LEN_2  2
 #define VOX_MQTT5_PROP_LEN_1  1
+
+/* MQTT 5 可变字节整数解码：前向声明，供 property_value_skip 使用 */
+static int decode_varint(const uint8_t* data, size_t len, uint32_t* value, size_t* num_bytes);
 
 /* MQTT 5 属性值跳过：根据属性 id 返回应跳过的字节数，变长属性根据 ptr 前 2 字节；无法解析时返回 -1 */
 static int property_value_skip(uint8_t id, const uint8_t* ptr, size_t len) {
@@ -118,23 +110,20 @@ static int property_value_skip(uint8_t id, const uint8_t* ptr, size_t len) {
         case VOX_MQTT5_PROP_SESSION_EXPIRY_INTERVAL:
             return (len >= VOX_MQTT5_PROP_LEN_4) ? VOX_MQTT5_PROP_LEN_4 : -1;
         case VOX_MQTT5_PROP_RECEIVE_MAXIMUM:
+        case VOX_MQTT5_PROP_TOPIC_ALIAS_MAXIMUM:
+        case VOX_MQTT5_PROP_TOPIC_ALIAS:
             return (len >= VOX_MQTT5_PROP_LEN_2) ? VOX_MQTT5_PROP_LEN_2 : -1;
         case VOX_MQTT5_PROP_MAXIMUM_QOS:
         case VOX_MQTT5_PROP_RETAIN_AVAILABLE:
-        case VOX_MQTT5_PROP_MAX_PACKET_SIZE:
-        case VOX_MQTT5_PROP_CONTENT_TYPE:
-            return (len >= VOX_MQTT5_PROP_LEN_1) ? VOX_MQTT5_PROP_LEN_1 : -1;
-        case VOX_MQTT5_PROP_TOPIC_ALIAS_MAXIMUM:
-        case VOX_MQTT5_PROP_TOPIC_ALIAS:
         case VOX_MQTT5_PROP_WILDCARD_SUB_AVAILABLE:
         case VOX_MQTT5_PROP_SUB_ID_AVAILABLE:
         case VOX_MQTT5_PROP_SHARED_SUB_AVAILABLE:
-        case VOX_MQTT5_PROP_MAX_QOS:
-        case VOX_MQTT5_PROP_SUBSCRIPTION_IDENTIFIER:
-        case VOX_MQTT5_PROP_MESSAGE_EXPIRY_INTERVAL:
-        case VOX_MQTT5_PROP_CORRELATION_DATA:
         case VOX_MQTT5_PROP_PAYLOAD_FORMAT_INDICATOR:
-            return (len >= VOX_MQTT5_PROP_LEN_2) ? VOX_MQTT5_PROP_LEN_2 : -1;
+            return (len >= VOX_MQTT5_PROP_LEN_1) ? VOX_MQTT5_PROP_LEN_1 : -1;
+        case VOX_MQTT5_PROP_MAX_PACKET_SIZE:
+        case VOX_MQTT5_PROP_MESSAGE_EXPIRY_INTERVAL:
+            return (len >= VOX_MQTT5_PROP_LEN_4) ? VOX_MQTT5_PROP_LEN_4 : -1;
+        case VOX_MQTT5_PROP_CONTENT_TYPE:
         case VOX_MQTT5_PROP_ASSIGNED_CLIENT_ID:
         case VOX_MQTT5_PROP_REASON_STRING:
         case VOX_MQTT5_PROP_SERVER_KEEP_ALIVE:
@@ -148,19 +137,28 @@ static int property_value_skip(uint8_t id, const uint8_t* ptr, size_t len) {
             }
             return -1;
         case VOX_MQTT5_PROP_AUTH_DATA:
+        case VOX_MQTT5_PROP_CORRELATION_DATA:
             /* 二进制：2 字节长度 + 数据 */
             if (len >= VOX_MQTT5_PROP_LEN_2) {
                 uint16_t n = (uint16_t)((ptr[0] << 8) | ptr[1]);
                 return (size_t)(VOX_MQTT5_PROP_LEN_2 + n) <= len ? (int)(VOX_MQTT5_PROP_LEN_2 + n) : -1;
             }
             return -1;
+        case VOX_MQTT5_PROP_SUBSCRIPTION_IDENTIFIER:
+            /* 可变字节整数：1-4 字节 */
+            {
+                uint32_t val;
+                size_t num_bytes;
+                int r = decode_varint(ptr, len, &val, &num_bytes);
+                return (r > 0) ? (int)num_bytes : -1;
+            }
         case VOX_MQTT5_PROP_USER_PROPERTY: {
             /* 一对 UTF-8 键值：2+len_k+2+len_v */
             if (len >= 4) {
                 uint16_t k = (uint16_t)((ptr[0] << 8) | ptr[1]);
                 if ((size_t)(4 + k) <= len) {
                     uint16_t v = (uint16_t)((ptr[2 + k] << 8) | ptr[3 + k]);
-                    if ((size_t)(4 + k + 2 + v) <= len) return (int)(4 + k + 2 + v);
+                    if ((size_t)(4 + k + v) <= len) return (int)(4 + k + v);
                 }
             }
             return -1;
@@ -426,7 +424,8 @@ static int parse_publish_payload(vox_mqtt_parser_t* p) {
     const char* topic = (const char*)(d + 2);
     size_t off = 2 + topic_len;
     uint16_t packet_id = 0;
-    if (p->flags & VOX_MQTT_PUBLISH_MASK_QOS) {
+    uint8_t qos = (p->flags >> VOX_MQTT_PUBLISH_QOS_SHIFT) & VOX_MQTT_PUBLISH_MASK_QOS;
+    if (qos > 0) {
         if (off + 2 > len) return -1;
         packet_id = (uint16_t)((d[off] << 8) | d[off + 1]);
         off += 2;
@@ -443,7 +442,7 @@ static int parse_publish_payload(vox_mqtt_parser_t* p) {
     size_t payload_len = off <= len ? len - off : 0;
 
     if (p->cb.on_publish) {
-        if (p->cb.on_publish(p->cb.user_data, p->flags & VOX_MQTT_PUBLISH_MASK_QOS, (p->flags >> VOX_MQTT_PUBLISH_RETAIN_SHIFT) & VOX_MQTT_PUBLISH_MASK_RETAIN, packet_id,
+        if (p->cb.on_publish(p->cb.user_data, qos, (p->flags >> VOX_MQTT_PUBLISH_RETAIN_SHIFT) & VOX_MQTT_PUBLISH_MASK_RETAIN, packet_id,
                 topic, topic_len, payload, payload_len) != 0)
             return -1;
     }
