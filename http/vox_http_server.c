@@ -101,6 +101,7 @@ static void vox_http_conn_reset_request(vox_http_conn_t* c) {
     c->ctx.sendfile_file = NULL;
     c->ctx.sendfile_offset = 0;
     c->ctx.sendfile_count = 0;
+    c->ctx.res_has_connection_header = false;
     c->deferred_pending = false;
 }
 
@@ -160,9 +161,10 @@ int vox_http_conn_send_response(void* conn) {
         c->should_close_after_write = false;
     }
 
-    /* 自动添加 Connection: close（若需要且用户未设置） */
+    /* 自动添加 Connection: close（若需要且用户未设置）；优先用缓存避免线性扫描 res.headers */
     if (c->should_close_after_write) {
-        if (!c->ctx.res.headers || !vox_http_res_has_header((const vox_vector_t*)c->ctx.res.headers, "Connection")) {
+        if (!c->ctx.res_has_connection_header &&
+            (!c->ctx.res.headers || !vox_http_res_has_header((const vox_vector_t*)c->ctx.res.headers, "Connection"))) {
             vox_http_context_header(&c->ctx, "Connection", "close");
         }
     }

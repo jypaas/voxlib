@@ -19,6 +19,9 @@
 extern "C" {
 #endif
 
+/* 前向声明，避免与 vox_http_engine.h -> vox_http_router.h -> vox_http_context.h 循环依赖 */
+struct vox_http_engine;
+
 typedef struct vox_http_request vox_http_request_t;
 typedef struct vox_http_response vox_http_response_t;
 
@@ -69,8 +72,25 @@ void vox_http_context_abort(vox_http_context_t* ctx);
 bool vox_http_context_is_aborted(const vox_http_context_t* ctx);
 /** 当前 handler 链下标（defer 前保存，用于异步回调后恢复执行） */
 size_t vox_http_context_get_index(const vox_http_context_t* ctx);
+/** handler 链长度（用于校验 resume_at 的 at_index 合法性） */
+size_t vox_http_context_get_handler_count(const vox_http_context_t* ctx);
 /** 恢复执行链：置 aborted=false 并设 index，之后可调用 next() 继续执行后续 handler */
 void vox_http_context_resume_at(vox_http_context_t* ctx, size_t at_index);
+
+/**
+ * 派发到指定的 handler 链（用于 vhost 等场景：先按 Host 选 vhost，再执行该 vhost 的路由链）
+ * 会设置 ctx 的 handlers/params 并立即执行该链（等价于设置后调用 next）。
+ * @param ctx HTTP 上下文
+ * @param handlers 要执行的 handler 数组（可为 NULL 表示无 handler）
+ * @param handler_count handler 数量
+ * @param params 路径参数（可为 NULL）
+ * @param param_count 参数数量
+ */
+void vox_http_context_dispatch(vox_http_context_t* ctx,
+                               vox_http_handler_cb* handlers,
+                               size_t handler_count,
+                               vox_http_param_t* params,
+                               size_t param_count);
 
 /* ===== async/defer response ===== */
 /**
@@ -140,6 +160,9 @@ void vox_http_context_set_user_data(vox_http_context_t* ctx, void* user_data);
 /* 便捷：获取 loop/mpool（用于 defer 场景分配状态对象） */
 vox_loop_t* vox_http_context_get_loop(const vox_http_context_t* ctx);
 vox_mpool_t* vox_http_context_get_mpool(const vox_http_context_t* ctx);
+
+/** 获取当前请求所属的 engine（用于 vhost 等按 engine 区分上下文的场景）。调用方需包含 vox_http_engine.h 后将返回值转为 vox_http_engine_t*。 */
+struct vox_http_engine* vox_http_context_get_engine(const vox_http_context_t* ctx);
 
 #ifdef __cplusplus
 }

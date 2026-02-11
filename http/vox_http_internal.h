@@ -55,6 +55,9 @@ struct vox_http_context {
     vox_file_t* sendfile_file;
     int64_t sendfile_offset;
     size_t sendfile_count;
+
+    /* 快速路径：handler 已通过 vox_http_context_header 设置过 Connection 头则置 true，避免 send_response 时线性扫描 res.headers */
+    bool res_has_connection_header;
 };
 
 /* ===== ws/transport 内部胶水（仅供 http/ 模块使用） ===== */

@@ -430,8 +430,17 @@ int vox_uring_poll(vox_uring_t* uring, int timeout_ms, vox_uring_event_cb event_
         if (ret == -ETIME || ret == -EINTR || ret == -EAGAIN) {
             return 0;
         }
-        VOX_LOG_ERROR("io_uring poll failed: ret=%d", ret);
-        return -1;
+        /* -EEXIST：内核/驱动已有完成事件或提交冲突，尝试消费 CQE 避免 loop 死循环 */
+        if (ret == -EEXIST) {
+            ret = io_uring_peek_cqe(&uring->ring, &cqe);
+            if (ret != 0) {
+                return 0;  /* 无 CQE，当作本轮无事件 */
+            }
+            /* 有 CQE，落入下方统一处理 */
+        } else {
+            VOX_LOG_ERROR("io_uring poll failed: ret=%d", ret);
+            return -1;
+        }
     }
 
     /* 处理所有完成事件 */

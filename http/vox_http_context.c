@@ -27,6 +27,7 @@ static const char* vox_http_reason_phrase(int status) {
 
 void vox_http_context_next(vox_http_context_t* ctx) {
     if (!ctx || ctx->aborted) return;
+    if (!ctx->handlers || ctx->handler_count == 0) return;
     /* Gin 风格：
      * - Engine/Server 只需调用一次 next()，它会顺序执行剩余 handlers
      * - Middleware 若想在后续 handlers 执行完后继续执行“后置逻辑”，可在自身内部再次调用 next()
@@ -52,10 +53,29 @@ size_t vox_http_context_get_index(const vox_http_context_t* ctx) {
     return ctx ? ctx->index : 0;
 }
 
+size_t vox_http_context_get_handler_count(const vox_http_context_t* ctx) {
+    return ctx ? ctx->handler_count : 0;
+}
+
 void vox_http_context_resume_at(vox_http_context_t* ctx, size_t at_index) {
     if (!ctx) return;
     ctx->aborted = false;
     ctx->index = at_index;
+}
+
+void vox_http_context_dispatch(vox_http_context_t* ctx,
+                               vox_http_handler_cb* handlers,
+                               size_t handler_count,
+                               vox_http_param_t* params,
+                               size_t param_count) {
+    if (!ctx) return;
+    ctx->handlers = handlers;
+    ctx->handler_count = handler_count;
+    ctx->params = params;
+    ctx->param_count = param_count;
+    ctx->index = 0;
+    ctx->aborted = false;
+    vox_http_context_next(ctx);
 }
 
 void vox_http_context_defer(vox_http_context_t* ctx) {
@@ -219,7 +239,10 @@ int vox_http_context_header(vox_http_context_t* ctx, const char* name, const cha
         ctx->res.headers = vox_vector_create(ctx->mpool);
         if (!ctx->res.headers) return -1;
     }
-    return vox_http_kv_push(ctx->mpool, (vox_vector_t*)ctx->res.headers, name, value);
+    int ret = vox_http_kv_push(ctx->mpool, (vox_vector_t*)ctx->res.headers, name, value);
+    if (ret == 0 && vox_http_strieq(name, strlen(name), "Connection", 10))
+        ctx->res_has_connection_header = true;
+    return ret;
 }
 
 int vox_http_context_write(vox_http_context_t* ctx, const void* data, size_t len) {
@@ -382,5 +405,9 @@ vox_loop_t* vox_http_context_get_loop(const vox_http_context_t* ctx) {
 
 vox_mpool_t* vox_http_context_get_mpool(const vox_http_context_t* ctx) {
     return ctx ? ctx->mpool : NULL;
+}
+
+struct vox_http_engine* vox_http_context_get_engine(const vox_http_context_t* ctx) {
+    return ctx ? ctx->engine : NULL;
 }
 

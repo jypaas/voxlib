@@ -624,11 +624,28 @@ int vox_socket_sendfile(vox_socket_t* sock, intptr_t file_fd_or_handle,
     {
         HANDLE hFile = (HANDLE)file_fd_or_handle;
         SOCKET s = sock->fd;
-        char buf[65536];
-        size_t total = 0;
         LARGE_INTEGER li;
         li.QuadPart = offset;
         if (SetFilePointerEx(hFile, li, NULL, FILE_BEGIN) == 0) return -1;
+
+        /* 优先使用 TransmitFile 零拷贝（mswsock.dll）；失败或不可用时回退到 ReadFile+send */
+        if (count <= 0xFFFFFFFFu) {
+            typedef BOOL (WINAPI *TransmitFile_t)(SOCKET, HANDLE, DWORD, DWORD, void*, void*, DWORD);
+            static int transmitfile_loaded = 0;
+            static TransmitFile_t pTransmitFile = NULL;
+            if (!transmitfile_loaded) {
+                HMODULE h = GetModuleHandleA("mswsock.dll");
+                pTransmitFile = h ? (TransmitFile_t)GetProcAddress(h, "TransmitFile") : NULL;
+                transmitfile_loaded = 1;
+            }
+            if (pTransmitFile && pTransmitFile(s, hFile, (DWORD)count, 0, NULL, NULL, 0)) {
+                if (out_sent) *out_sent = count;
+                return 0;
+            }
+        }
+
+        char buf[65536];
+        size_t total = 0;
         while (total < count) {
             DWORD to_read = (DWORD)((count - total) > sizeof(buf) ? sizeof(buf) : (count - total));
             DWORD nread = 0;

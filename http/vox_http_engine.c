@@ -18,6 +18,7 @@ struct vox_http_engine {
     vox_mpool_t* mpool;
     vox_http_router_t* router;
     vox_vector_t* global_middleware; /* element: vox_http_handler_cb* */
+    void* user_data;
 };
 
 static int vox_http_vec_push_handler(vox_mpool_t* mpool, vox_vector_t* vec, vox_http_handler_cb cb) {
@@ -220,5 +221,13 @@ vox_mpool_t* vox_http_engine_get_mpool(vox_http_engine_t* engine) {
 
 vox_loop_t* vox_http_engine_get_loop(vox_http_engine_t* engine) {
     return engine ? engine->loop : NULL;
+}
+
+void vox_http_engine_set_user_data(vox_http_engine_t* engine, void* user_data) {
+    if (engine) engine->user_data = user_data;
+}
+
+void* vox_http_engine_get_user_data(const vox_http_engine_t* engine) {
+    return engine ? engine->user_data : NULL;
 }
 

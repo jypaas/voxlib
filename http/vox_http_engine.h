@@ -56,6 +56,10 @@ vox_vector_t* vox_http_engine_get_global_middleware(vox_http_engine_t* engine);
 vox_mpool_t* vox_http_engine_get_mpool(vox_http_engine_t* engine);
 vox_loop_t* vox_http_engine_get_loop(vox_http_engine_t* engine);
 
+/** 可选：绑定到 engine 的用户数据（如 vox-httpd 每端口绑定的 vhost 表） */
+void vox_http_engine_set_user_data(vox_http_engine_t* engine, void* user_data);
+void* vox_http_engine_get_user_data(const vox_http_engine_t* engine);
+
 #ifdef __cplusplus
 }
 #endif
