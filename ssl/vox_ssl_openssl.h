@@ -37,6 +37,12 @@ size_t vox_ssl_openssl_bio_pending(vox_ssl_session_t* session, vox_ssl_bio_type_
 ssize_t vox_ssl_openssl_bio_read(vox_ssl_session_t* session, vox_ssl_bio_type_t bio_type, void* buf, size_t len);
 ssize_t vox_ssl_openssl_bio_write(vox_ssl_session_t* session, vox_ssl_bio_type_t bio_type, const void* buf, size_t len);
 
+/* 密钥导出（RFC 5705，用于 DTLS-SRTP 等） */
+int vox_ssl_openssl_session_export_keying_material(vox_ssl_session_t* session,
+                                                    const char* label, size_t label_len,
+                                                    const void* context, size_t context_len,
+                                                    void* out, size_t out_len);
+
 #ifdef __cplusplus
 }
 #endif

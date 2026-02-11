@@ -303,3 +303,36 @@ ssize_t vox_ssl_bio_write(vox_ssl_session_t* session, vox_ssl_bio_type_t bio_typ
     return -1;
 #endif
 }
+
+int vox_ssl_session_export_keying_material(vox_ssl_session_t* session,
+                                           const char* label, size_t label_len,
+                                           const void* context, size_t context_len,
+                                           void* out, size_t out_len) {
+    if (!session || !label || !out || out_len == 0) {
+        return -1;
+    }
+#if defined(VOX_USE_OPENSSL)
+    return vox_ssl_openssl_session_export_keying_material(session, label, label_len,
+                                                         context, context_len, out, out_len);
+#elif defined(VOX_USE_WOLFSSL)
+    (void)label_len;
+    (void)context;
+    (void)context_len;
+    (void)out_len;
+    return -1;  /* 未实现 */
+#elif defined(VOX_USE_MBEDTLS)
+    (void)label_len;
+    (void)context;
+    (void)context_len;
+    (void)out_len;
+    return -1;  /* 未实现 */
+#else
+    (void)label;
+    (void)label_len;
+    (void)context;
+    (void)context_len;
+    (void)out;
+    (void)out_len;
+    return -1;
+#endif
+}

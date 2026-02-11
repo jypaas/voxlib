@@ -56,6 +56,8 @@ typedef struct {
     const char* protocols;       /* 支持的协议版本（如 "TLSv1.2,TLSv1.3"） */
     int dtls_mtu;                /* DTLS 应用层 MTU（字节），0 表示使用默认值 1440 */
                                 /* 建议值：IPv4 使用 1440，IPv6 使用 1420，最大不超过 1500 */
+    const char* use_srtp;        /* DTLS-SRTP（RFC 5764）：SRTP 套件列表，逗号或冒号分隔，
+                                   如 "SRTP_AES128_CM_SHA1_80"；仅 DTLS 有效，NULL 表示不启用 */
 } vox_ssl_config_t;
 
 /* ===== SSL Context API ===== */
@@ -202,6 +204,23 @@ ssize_t vox_ssl_bio_read(vox_ssl_session_t* session, vox_ssl_bio_type_t bio_type
  * @return 成功返回写入的字节数，失败返回-1
  */
 ssize_t vox_ssl_bio_write(vox_ssl_session_t* session, vox_ssl_bio_type_t bio_type, const void* buf, size_t len);
+
+/**
+ * 从已连接的 SSL/TLS session 导出密钥材料（RFC 5705）
+ * 仅当握手完成（VOX_SSL_STATE_CONNECTED）时有效，用于 DTLS-SRTP（RFC 5764）等场景。
+ * @param session session 指针
+ * @param label   导出标签（如 "EXTRACTOR-dtls_srtp"）
+ * @param label_len   标签长度
+ * @param context 可选上下文，可为 NULL
+ * @param context_len 上下文长度，0 表示不使用 context
+ * @param out     输出缓冲区
+ * @param out_len 要导出的字节数
+ * @return 0 成功，-1 失败（未连接、未实现或参数无效）
+ */
+int vox_ssl_session_export_keying_material(vox_ssl_session_t* session,
+                                          const char* label, size_t label_len,
+                                          const void* context, size_t context_len,
+                                          void* out, size_t out_len);
 
 #ifdef __cplusplus
 }

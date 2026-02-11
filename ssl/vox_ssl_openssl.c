@@ -14,7 +14,9 @@
 #include <openssl/bio.h>
 #include <openssl/x509.h>
 #include <openssl/pem.h>
+#endif
 
+#ifdef VOX_USE_OPENSSL
 /* OpenSSL Context 结构 */
 struct vox_ssl_context {
     SSL_CTX* ctx;                /* OpenSSL context */
@@ -220,6 +222,16 @@ int vox_ssl_openssl_context_configure(vox_ssl_context_t* ctx, const vox_ssl_conf
         }
         ctx->dtls_mtu = config->dtls_mtu;
     }
+
+    /* DTLS-SRTP 扩展（RFC 5764）：协商 SRTP 保护套件，便于握手后导出密钥 */
+#if !defined(OPENSSL_NO_SRTP)
+    if (ctx->is_dtls && config->use_srtp && config->use_srtp[0] != '\0') {
+        if (SSL_CTX_set_tlsext_use_srtp(ctx->ctx, config->use_srtp) != 0) {
+            VOX_LOG_ERROR("Failed to set DTLS-SRTP profiles: %s", config->use_srtp);
+            return -1;
+        }
+    }
+#endif
 
     return 0;
 }
@@ -538,6 +550,31 @@ int vox_ssl_openssl_session_get_error_string(vox_ssl_session_t* session, char* b
     buf[err_len] = '\0';
 
     return (int)err_len;
+}
+
+int vox_ssl_openssl_session_export_keying_material(vox_ssl_session_t* session,
+                                                   const char* label, size_t label_len,
+                                                   const void* context, size_t context_len,
+                                                   void* out, size_t out_len) {
+    if (!session || !session->ssl || !label || !out || out_len == 0) {
+        return -1;
+    }
+    if (session->state != VOX_SSL_STATE_CONNECTED) {
+        return -1;
+    }
+    if (label_len > 249u) {
+        return -1;  /* TLS 1.3 标签长度上限 */
+    }
+    {
+        const unsigned char* ctx_ptr = (const unsigned char*)context;
+        int use_ctx = (context_len > 0) ? 1 : 0;
+        int ret = SSL_export_keying_material(session->ssl,
+                                            (unsigned char*)out, out_len,
+                                            label, label_len,
+                                            ctx_ptr, context_len,
+                                            use_ctx);
+        return (ret == 1) ? 0 : -1;
+    }
 }
 
 /* ===== BIO 操作 API ===== */
